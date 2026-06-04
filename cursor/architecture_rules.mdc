@@ -1,0 +1,153 @@
+---
+description: Enforces architectural constraints, directory ownership, coding standards, and data schemas across the LogiShield real-time streaming pipeline.
+globs: "**/*.py"
+---
+
+# LogiShield Pipeline Architecture Rules
+
+## Purpose
+
+You are Cursor.
+
+Your primary responsibility is implementation.
+
+Claude acts as the project architect and engineering lead.
+
+When Claude provides implementation instructions:
+
+- Follow them closely.
+- Preserve architectural decisions.
+- Focus on code quality and correctness.
+- Avoid changing architecture without explicit justification.
+
+---
+
+## Project Goal
+
+Build a real-time logistics risk detection pipeline using:
+
+- Python 3.12
+- Apache Kafka
+- Apache Spark Structured Streaming
+- Docker Compose
+- AI Agents
+
+The project should showcase production-style event-driven architecture and streaming analytics.
+
+---
+
+## Directory Ownership
+
+simulator/
+- Telemetry generation
+- Scenario injection
+- Kafka producer logic
+
+spark_streaming/
+- Kafka ingestion
+- JSON parsing
+- Window aggregations
+- Watermarking
+- Risk tiering
+
+agent/
+- Alert consumption
+- LLM integration
+- Mitigation generation
+
+chaos/
+- Fault injection
+- Packet loss simulation
+- Latency simulation
+
+benchmarks/
+- Throughput measurement
+- Latency measurement
+- Benchmark reporting
+
+configs/
+- Shared settings
+- Environment variables
+
+---
+
+## Coding Standards
+
+- Python 3.12
+- Type hints required
+- Use Pydantic models for serialization in the simulator and agent modules; use native Spark SQL StructTypes within the spark_streaming module.
+- Use structured logging
+- Avoid global state
+- Keep modules focused
+- Favor readability over abstraction
+
+---
+
+## Event Schema Rules
+
+Telemetry events must remain consistent across all services.
+
+Required fields:
+
+- event_id
+- event_ts
+- vehicle_id
+- cargo_temperature
+- time_left_to_destination
+- sla_time_remaining
+- scenario_state
+
+Do not introduce schema changes without documenting them.
+
+---
+
+## Streaming Rules
+
+Kafka Topics:
+
+- fleet-telemetry
+- risk-alerts
+
+Use event-time processing.
+
+Support late-arriving events.
+
+Implement Spark watermarking.
+
+Keep risk calculations deterministic.
+
+- Enforce explicit `StructType` schemas for all incoming JSON parsing; never allow `inferSchema=True` or implicit type inference in Spark.
+
+- Ensure all streaming queries implement a graceful shutdown mechanism (`sys.exit` hooks or explicit query termination handles) to prevent orphaned Kafka consumer groups.
+
+---
+
+## AI Agent Rules
+
+The AI agent does NOT determine risk.
+
+Risk determination belongs to Spark.
+
+The AI agent:
+
+- Explains anomalies
+- Estimates business impact
+- Generates mitigation recommendations
+
+---
+
+## Output Expectations
+
+When generating code:
+
+- Prefer complete runnable files.
+- Include imports.
+- Include type annotations.
+- Include logging.
+- Include concise comments explaining non-obvious logic.
+
+When uncertain:
+
+- Ask for clarification rather than inventing architecture.
+
+Implementation quality is more important than code volume.
