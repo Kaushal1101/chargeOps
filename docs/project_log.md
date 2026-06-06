@@ -41,8 +41,33 @@ Bitnami has removed their Spark images from Docker Hub. Switched to the official
 **Init container for topic creation**
 `kafka-init` runs `kafka-topics` commands after Kafka passes its healthcheck, then exits. Fully automated — `docker compose up -d` creates all infrastructure and topics in one step.
 
-### Remaining Phase 1 Items
+### Phase 1 Complete
 
-- [ ] `scripts/smoke_test.py` — Spark-to-Kafka connectivity validation
-- [ ] Spark-to-Kafka smoke test passes
-- [ ] Python virtual environment initialized and `pip install -r requirements.txt` confirmed clean
+All exit criteria satisfied. Phase 2 can begin.
+
+---
+
+## 2026-06-06 — Phase 1: Python Environment and Smoke Test
+
+### What Was Completed
+
+- Python virtual environment initialized at `venv/` using Python 3.12
+- `pip install -r requirements.txt` completed cleanly
+- `scripts/smoke_test.py` created and passed — Spark connected to Kafka and accessed `fleet-telemetry`
+
+### Key Decisions Made
+
+**Python 3.12 enforced for venv**
+System default was Python 3.14, which caused `pydantic-core==2.18.4` to fail during wheel build. Root cause: `pydantic-core` uses PyO3 0.21.2, which only supports up to Python 3.12. Recreated venv with `python3.12 -m venv venv`. This matches the Python 3.12 target specified in the Phase 1 plan.
+
+**Smoke test uses host-side Kafka listener**
+`smoke_test.py` connects via `localhost:9093` because it runs on the host machine. When Spark runs inside Docker in Phase 2, it must connect via `kafka:9092` instead. This distinction must be preserved when writing the Phase 2 streaming job.
+
+### Smoke Test Result
+
+```
+[SMOKE TEST] Row count: 0
+[SMOKE TEST] PASSED — Spark connected to Kafka and accessed fleet-telemetry
+```
+
+Row count of 0 is expected — no simulator is running yet. Empty topic is a valid state at this stage.
