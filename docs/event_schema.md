@@ -16,15 +16,19 @@ The telemetry event represents a single state update from a truck.
 
 | Field | Type | Required | Description |
 |---------|---------|---------|-------------|
-| event_id | string | Yes | Unique identifier for the event |
+| event_id | string | Yes | Unique identifier for the event (UUID v4) |
 | event_ts | string (ISO-8601) | Yes | Timestamp when the event occurred |
 | vehicle_id | string | Yes | Truck identifier |
 | cargo_temperature | float | Yes | Current cargo temperature in °C |
 | time_left_to_destination | integer | Yes | Estimated minutes remaining to destination |
 | sla_time_remaining | integer | Yes | Remaining SLA time buffer in minutes |
 | scenario_state | string | Yes | Simulator injection state (GREEN, YELLOW, RED) — see note below |
+| sla_buffer_threshold | integer | Yes | Minimum acceptable delivery buffer in minutes before risk escalation |
+| cargo_temp_threshold | float | Yes | Maximum acceptable cargo temperature in °C |
 
 **Note on `scenario_state`:** This field reflects the scenario the simulator is actively injecting, not the risk tier independently calculated by Spark. In normal operation these will align. During chaos testing or edge-case simulation they may diverge. `scenario_state` is the simulator's control variable; `risk_tier` is Spark's output.
+
+**Note on threshold fields:** `sla_buffer_threshold` and `cargo_temp_threshold` are set per-vehicle at simulator initialization and repeated on every event. This makes each event self-describing — Spark can evaluate risk on a single row without joining against external state. These fields are simulator-owned and must never be modified by downstream services.
 
 ---
 
@@ -32,13 +36,15 @@ The telemetry event represents a single state update from a truck.
 
 ```json
 {
-  "event_id": "evt_000001",
+  "event_id": "3f4a1b2c-8e9d-4f5a-b6c7-1d2e3f4a5b6c",
   "event_ts": "2026-06-05T10:15:30Z",
   "vehicle_id": "TRUCK_101",
   "cargo_temperature": 4.2,
   "time_left_to_destination": 95,
   "sla_time_remaining": 140,
-  "scenario_state": "GREEN"
+  "scenario_state": "GREEN",
+  "sla_buffer_threshold": 30,
+  "cargo_temp_threshold": 5.0
 }
 ```
 

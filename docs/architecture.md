@@ -116,13 +116,15 @@ The telemetry schema is shared across all services.
 
 | Field | Description |
 |---------|-------------|
-| event_id | Unique event identifier |
+| event_id | Unique event identifier (UUID v4) |
 | event_ts | Event timestamp used for event-time processing |
 | vehicle_id | Truck identifier |
 | cargo_temperature | Current cargo temperature |
 | time_left_to_destination | Estimated remaining travel time |
 | sla_time_remaining | Remaining SLA buffer |
 | scenario_state | Simulator injection state (GREEN, YELLOW, RED) — distinct from the risk_tier calculated by Spark |
+| sla_buffer_threshold | Per-vehicle minimum acceptable delivery buffer in minutes |
+| cargo_temp_threshold | Per-vehicle maximum acceptable cargo temperature in °C |
 
 See [event_schema.md](event_schema.md) for full schema specification including derived fields and risk alert schema.
 
