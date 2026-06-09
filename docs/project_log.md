@@ -108,3 +108,44 @@ Run from project root with venv active. Connects to Kafka via `localhost:9093` (
 ### Phase 2 Complete
 
 All exit criteria satisfied. Phase 3 (Spark Structured Streaming) can begin.
+
+---
+
+## 2026-06-10 — Phase 3A: Spark Ingestion Foundation
+
+### What Was Completed
+
+- `spark_streaming/__init__.py` — package marker
+- `spark_streaming/stream_processor.py` — Spark Structured Streaming job consuming from `fleet-telemetry` and printing raw events to console
+- Phase 3A plan doc updated with Kafka connector JAR requirement, run instructions, and broker address decision
+
+### Key Decisions Made
+
+**Local mode for Phase 3**
+Spark runs via `spark-submit --master local[*]` on the host machine rather than submitting to the Docker cluster. Simpler networking, easier debugging, sufficient for all Phase 3 sub-phases. Spark UI available at `localhost:4040`.
+
+**Kafka connector JAR required at submit time**
+`spark-sql-kafka-0-10_2.12:3.5.1` must be passed via `--packages`. Without it Spark cannot read Kafka streams. JAR is downloaded on first run and cached locally.
+
+**`startingOffsets: earliest`**
+Ensures the job immediately processes the existing message backlog on startup rather than waiting for new events. Useful for validation and replay.
+
+**Run command**
+```bash
+spark-submit \
+  --master 'local[*]' \
+  --packages 'org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1' \
+  spark_streaming/stream_processor.py
+```
+
+### Validation Results
+
+- All 3 trucks (TRUCK_101, TRUCK_102, TRUCK_103) visible in console output
+- Events correctly partitioned: TRUCK_101/102 on partition 1, TRUCK_103 on partition 2
+- GREEN, YELLOW, and RED scenario states all observed in live data
+- Historical backlog consumed from offset 3 (Batch 0), live data from offset ~13,936 (Batch 1+)
+- Multiple batches processed with no errors
+
+### Phase 3A Complete
+
+Kafka → Spark connectivity proven. Phase 3B can begin.
