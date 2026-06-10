@@ -67,6 +67,58 @@ The **LogiShield Pipeline** is a real-time logistics risk detection system that 
 
 ### Decision 6: Python 3.12 Enforced for Virtual Environment
 
+---
+
+### Decision 7: Spark Checkpoint Location at /tmp (Dev Only)
+
+**Context:** The Spark Kafka write sink requires a `checkpointLocation` — without it the query fails with `AnalysisException` on startup. This was not in the Phase 3E spec; Cursor added it correctly.
+
+**The Decision:** Use `/tmp/logishield-checkpoints/risk-alerts` for development.
+
+**Consequences:**
+- First run creates the directory; subsequent runs resume from the saved offsets
+- macOS may purge `/tmp` on reboot — if this happens, the checkpoint is lost and the job resets
+- If the schema or output topic changes and offsets become stale, delete the checkpoint directory: `rm -rf /tmp/logishield-checkpoints/risk-alerts`
+
+**Deferred decision for benchmarking/production:** Move to a stable path such as `./.checkpoints/risk-alerts` inside the project directory. Do not commit the checkpoint directory to git.
+
+---
+
+### Decision 8: `update` Output Mode Produces Duplicate Alerts (Deferred to Phase 4)
+
+**Context:** With a 30-second slide and 10-minute window, `update` mode emits every window that changed in each micro-batch. The same `(window_end, vehicle_id)` pair will be re-emitted multiple times as new telemetry updates the rolling average — each emission produces a new Kafka message with a new `event_id`. A sustained RED condition will generate approximately 20 duplicate alerts per truck per emission cycle.
+
+**Current state:** Accepted for Phase 3E. The pipeline is functionally correct — risk detection works — but the alert volume is noisy.
+
+**Three options for Phase 4:**
+1. **Live with it — agent deduplicates downstream.** Simplest. AI agent filters by `(window_end, vehicle_id)` before processing. No pipeline changes.
+2. **Switch to `append` mode.** Emits each window exactly once after the watermark closes it. Adds ~5 minutes of latency. Cleaner data, worse demo responsiveness.
+3. **`foreachBatch` with transition state.** Track the last-emitted tier per vehicle; only write when the tier changes. Most production-realistic. Most implementation complexity.
+
+**Recommended for Phase 4:** Option 1 (agent deduplication) to unblock Phase 4, then Option 3 for the benchmarking phase.
+
+---
+
+### Decision 9: Alert `event_id` Should Be Deterministic Hash (Deferred to Phase 4)
+
+**Context:** Related to Decision 8. Each duplicate emission of the same window generates a fresh UUID, making `event_id` useless for downstream deduplication — the AI agent cannot tell whether two alerts represent the same event or two distinct ones.
+
+**Deferred decision:** Replace `uuid4()` with `hash(window_end || vehicle_id || risk_tier)` as the alert `event_id`. This makes the ID deterministic and idempotent — the same window-vehicle-tier combination always produces the same ID, enabling safe deduplication by `event_id` alone.
+
+**Implement in Phase 4** alongside the deduplication strategy chosen for Decision 8.
+
+---
+
+### Decision 10: Alert Timestamp and Reason Formatting (Deferred to Phase 4)
+
+**Context:** Two formatting deviations from the canonical schema were identified in Phase 3E:
+
+1. **`event_ts` format mismatch.** The risk alert `event_ts` is produced by `.cast("string")` on `window.end`, which yields Spark's default format: `"2026-06-10 21:33:45"` (space separator, no timezone). The simulator and `event_schema.md` use ISO-8601: `"2026-06-10T21:33:45.123456Z"`. Any downstream parser expecting ISO-8601 will fail on alert events. Fix: replace `.cast("string")` with `date_format(col("window.end"), "yyyy-MM-dd'T'HH:mm:ss'Z'")`.
+
+2. **`reason` field float precision.** The spec defines temperature reasons as `"...: 6.78C"` (2 decimal places). The current implementation uses `.cast("string")` which emits full double precision: `"...: 6.7831234567C"`. Fix: replace `.cast("string")` with `format_number(col("max_cargo_temperature"), 2)`.
+
+**Implement both in Phase 4** when the alert schema is hardened for AI agent consumption.
+
 **Context:** The system default Python version on the development machine was 3.14. The first `pip install -r requirements.txt` run failed during the `pydantic-core` wheel build.
 
 **The Decision:** Create the virtual environment explicitly with `python3.12 -m venv venv`.

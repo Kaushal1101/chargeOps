@@ -1,5 +1,20 @@
+import uuid
+
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, window, avg, max as spark_max
+from pyspark.sql.functions import (
+    avg,
+    col,
+    concat,
+    first,
+    from_json,
+    lit,
+    max as spark_max,
+    struct,
+    to_json,
+    udf,
+    when,
+    window,
+)
 from pyspark.sql.types import (
     DoubleType,
     IntegerType,
@@ -79,14 +94,84 @@ def run():
         .agg(
             avg(col("delivery_buffer")).alias("avg_delivery_buffer"),
             spark_max(col("cargo_temperature")).alias("max_cargo_temperature"),
+            first(col("sla_buffer_threshold")).alias("sla_buffer_threshold"),
+            first(col("cargo_temp_threshold")).alias("cargo_temp_threshold"),
         )
     )
 
+    tiered = windowed.withColumn(
+        "risk_tier",
+        when(
+            (col("avg_delivery_buffer") < 0)
+            | (col("max_cargo_temperature") > col("cargo_temp_threshold")),
+            "RED",
+        )
+        .when(
+            (col("avg_delivery_buffer") < col("sla_buffer_threshold"))
+            | (col("max_cargo_temperature") > col("cargo_temp_threshold") * 0.9),
+            "YELLOW",
+        )
+        .otherwise("GREEN"),
+    )
+
+    alerts = tiered.filter(col("risk_tier") != "GREEN")
+
+    gen_id = udf(lambda: str(uuid.uuid4()), StringType()).asNondeterministic()
+
+    alert_records = alerts.select(
+        gen_id().alias("event_id"),
+        col("window.end").cast("string").alias("event_ts"),
+        col("vehicle_id"),
+        col("risk_tier"),
+        col("avg_delivery_buffer").cast(IntegerType()).alias("delivery_buffer"),
+        col("max_cargo_temperature").alias("cargo_temperature"),
+        when(
+            col("risk_tier") == "RED",
+            when(
+                col("avg_delivery_buffer") < 0,
+                concat(
+                    lit("Delivery buffer breached SLA: "),
+                    col("avg_delivery_buffer").cast("integer").cast("string"),
+                    lit("min"),
+                ),
+            ).otherwise(
+                concat(
+                    lit("Cargo temperature exceeded threshold: "),
+                    col("max_cargo_temperature").cast("string"),
+                    lit("C"),
+                )
+            ),
+        )
+        .otherwise(
+            when(
+                col("avg_delivery_buffer") < col("sla_buffer_threshold"),
+                concat(
+                    lit("Delivery buffer below threshold: "),
+                    col("avg_delivery_buffer").cast("integer").cast("string"),
+                    lit("min"),
+                ),
+            ).otherwise(
+                concat(
+                    lit("Cargo temperature approaching threshold: "),
+                    col("max_cargo_temperature").cast("string"),
+                    lit("C"),
+                )
+            )
+        )
+        .alias("reason"),
+    )
+
+    kafka_payload = alert_records.select(
+        col("vehicle_id").cast(StringType()).alias("key"),
+        to_json(struct(*[col(c) for c in alert_records.columns])).alias("value"),
+    )
+
     query = (
-        windowed.writeStream.format("console")
+        kafka_payload.writeStream.format("kafka")
+        .option("kafka.bootstrap.servers", "localhost:9093")
+        .option("topic", "risk-alerts")
+        .option("checkpointLocation", "/tmp/logishield-checkpoints/risk-alerts")
         .outputMode("update")
-        .option("truncate", "false")
-        .option("numRows", "10")
         .trigger(processingTime="5 seconds")
         .start()
     )
