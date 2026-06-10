@@ -72,3 +72,72 @@ The **LogiShield Pipeline** is a real-time logistics risk detection system that 
 **The Decision:** Create the virtual environment explicitly with `python3.12 -m venv venv`.
 
 **Justification:** `pydantic==2.7.4` depends on `pydantic-core`, which is compiled via PyO3. PyO3 version 0.21.2 only supports up to Python 3.12. Python 3.14 caused a hard build failure. Python 3.12 was already installed on the machine and is the version explicitly targeted in the Phase 1 specification. The project must always be run inside this venv to ensure dependency compatibility.
+
+---
+
+### Decision 7: Spark Checkpoint Location at /tmp (Dev Only)
+
+**Context:** The Spark Kafka write sink requires a `checkpointLocation` — without it the query fails with `AnalysisException` on startup. This was not in the Phase 3E spec; Cursor added it correctly.
+
+**The Decision:** Use `/tmp/logishield-checkpoints/risk-alerts` for development.
+
+**Consequences:**
+- First run creates the directory; subsequent runs resume from the saved offsets
+- macOS may purge `/tmp` on reboot — if this happens, the checkpoint is lost and the job resets
+- If the schema or output topic changes and offsets become stale, delete the checkpoint directory: `rm -rf /tmp/logishield-checkpoints/risk-alerts`
+
+**Deferred decision for benchmarking/production:** Move to a stable path such as `./.checkpoints/risk-alerts` inside the project directory. Do not commit the checkpoint directory to git.
+
+---
+
+### Decision 8: `update` Output Mode Produces Duplicate Alerts (Deferred to Phase 4)
+
+**Context:** With a 30-second slide and 10-minute window, `update` mode emits every window that changed in each micro-batch. The same `(window_end, vehicle_id)` pair will be re-emitted multiple times as new telemetry updates the rolling average — each emission produces a new Kafka message with a new `event_id`. A sustained RED condition will generate approximately 20 duplicate alerts per truck per emission cycle.
+
+**Current state:** Accepted for Phase 3E. The pipeline is functionally correct — risk detection works — but the alert volume is noisy.
+
+**Three options for Phase 4:**
+1. **Live with it — agent deduplicates downstream.** Simplest. AI agent filters by `(window_end, vehicle_id)` before processing. No pipeline changes.
+2. **Switch to `append` mode.** Emits each window exactly once after the watermark closes it. Adds ~5 minutes of latency. Cleaner data, worse demo responsiveness.
+3. **`foreachBatch` with transition state.** Track the last-emitted tier per vehicle; only write when the tier changes. Most production-realistic. Most implementation complexity.
+
+**Recommended for Phase 4:** Option 1 (agent deduplication) to unblock Phase 4, then Option 3 for the benchmarking phase.
+
+---
+
+### Decision 9: Alert `event_id` Should Be Deterministic Hash (Deferred to Phase 4)
+
+**Context:** Related to Decision 8. Each duplicate emission of the same window generates a fresh UUID, making `event_id` useless for downstream deduplication — the AI agent cannot tell whether two alerts represent the same event or two distinct ones.
+
+**Deferred decision:** Replace `uuid4()` with `hash(window_end || vehicle_id || risk_tier)` as the alert `event_id`. This makes the ID deterministic and idempotent — the same window-vehicle-tier combination always produces the same ID, enabling safe deduplication by `event_id` alone.
+
+**Implement in Phase 4** alongside the deduplication strategy chosen for Decision 8.
+
+---
+
+### Decision 10: Alert Timestamp and Reason Formatting (Deferred to Phase 4)
+
+**Context:** Two formatting deviations from the canonical schema were identified in Phase 3E:
+
+1. **`event_ts` format mismatch.** The risk alert `event_ts` is produced by `.cast("string")` on `window.end`, which yields Spark's default format: `"2026-06-10 21:33:45"` (space separator, no timezone). The simulator and `event_schema.md` use ISO-8601: `"2026-06-10T21:33:45.123456Z"`. Any downstream parser expecting ISO-8601 will fail on alert events. Fix: replace `.cast("string")` with `date_format(col("window.end"), "yyyy-MM-dd'T'HH:mm:ss'Z'")`.
+
+2. **`reason` field float precision.** The spec defines temperature reasons as `"...: 6.78C"` (2 decimal places). The current implementation uses `.cast("string")` which emits full double precision: `"...: 6.7831234567C"`. Fix: replace `.cast("string")` with `format_number(col("max_cargo_temperature"), 2)`.
+
+**Implement both in Phase 4** when the alert schema is hardened for AI agent consumption.
+
+---
+
+### Known Issue 1: YELLOW Alerts Eclipsed by RED in Long-Running Windows
+
+**Observed:** During Phase 3E validation, only RED alerts appeared in `risk-alerts`. No YELLOW alerts were produced despite the simulator cycling through YELLOW states.
+
+**Root cause:** The simulator completes a full GREEN→YELLOW→RED cycle every 15 seconds. The aggregation window is 10 minutes wide. Within any 10-minute window, ~40 full cycles occur — meaning every window contains RED-level temperature events. Since `max_cargo_temperature` picks the highest value in the window, even a single RED event pushes the max above the threshold and classifies the entire window as RED. YELLOW events within the same window are eclipsed.
+
+**Impact:** YELLOW tier classification is theoretically correct but practically unreachable in normal operation. The pipeline will produce RED alerts when conditions are dangerous, but the intermediate YELLOW warning stage is effectively invisible.
+
+**Options to address in Phase 4 or beyond:**
+1. Use `avg(cargo_temperature)` instead of `max` — smoother signal, less sensitive to transient spikes
+2. Slow the simulator cycle (e.g. GREEN for 60 steps, YELLOW for 30, RED for 15) so windows capture distinct phases
+3. Separate the temperature and buffer metrics into independent classifiers rather than combining them with `max`
+
+**Not blocking Phase 4** — the AI agent will still receive meaningful RED alerts. Revisit when tuning alert quality.

@@ -108,3 +108,114 @@ Run from project root with venv active. Connects to Kafka via `localhost:9093` (
 ### Phase 2 Complete
 
 All exit criteria satisfied. Phase 3 (Spark Structured Streaming) can begin.
+
+---
+
+## 2026-06-10 — Phase 3A: Spark Ingestion Foundation
+
+### What Was Completed
+
+- `spark_streaming/__init__.py` — package marker
+- `spark_streaming/stream_processor.py` — Spark Structured Streaming job consuming from `fleet-telemetry` and printing raw events to console
+- Phase 3A plan doc updated with Kafka connector JAR requirement, run instructions, and broker address decision
+
+### Key Decisions Made
+
+**Local mode for Phase 3**
+Spark runs via `spark-submit --master local[*]` on the host machine rather than submitting to the Docker cluster. Simpler networking, easier debugging, sufficient for all Phase 3 sub-phases. Spark UI available at `localhost:4040`.
+
+**Kafka connector JAR required at submit time**
+`spark-sql-kafka-0-10_2.12:3.5.1` must be passed via `--packages`. Without it Spark cannot read Kafka streams. JAR is downloaded on first run and cached locally.
+
+**`startingOffsets: earliest`**
+Ensures the job immediately processes the existing message backlog on startup rather than waiting for new events. Useful for validation and replay.
+
+**Run command**
+```bash
+spark-submit \
+  --master 'local[*]' \
+  --packages 'org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1' \
+  spark_streaming/stream_processor.py
+```
+
+### Validation Results
+
+- All 3 trucks (TRUCK_101, TRUCK_102, TRUCK_103) visible in console output
+- Events correctly partitioned: TRUCK_101/102 on partition 1, TRUCK_103 on partition 2
+- GREEN, YELLOW, and RED scenario states all observed in live data
+- Historical backlog consumed from offset 3 (Batch 0), live data from offset ~13,936 (Batch 1+)
+- Multiple batches processed with no errors
+
+### Phase 3A Complete
+
+Kafka → Spark connectivity proven. Phase 3B can begin.
+
+---
+
+## 2026-06-10 — Phase 3B: Schema Parsing & Structured DataFrames
+
+### What Was Completed
+
+- `spark_streaming/stream_processor.py` updated to parse raw Kafka JSON payloads into typed Spark columns using `from_json()` and an explicit `StructType`
+- `event_ts` cast to `TimestampType` — ready for event-time windowing in Phase 3D
+- Raw `value` column dropped after parsing — redundant once structured columns exist
+- Kafka metadata (`topic`, `partition`, `offset`, `timestamp`) preserved alongside telemetry fields
+
+### Key Decisions Made
+
+**`event_ts` cast to `TimestampType` in 3B, not deferred**
+`event_ts` arrives as an ISO-8601 string. Casting it here avoids a refactor in Phase 3D where it is required as the event-time column for windowing and watermarking.
+
+**Raw `value` column dropped**
+Once `from_json()` extracts structured columns, the original JSON string is redundant and adds noise to every console row.
+
+### Phase 3B Complete
+
+Raw Kafka messages now produce a fully typed Spark DataFrame. Phase 3C can begin.
+
+---
+
+## 2026-06-10 — Phase 3C: Derived Metrics
+
+### What Was Completed
+
+- `spark_streaming/stream_processor.py` updated to compute `delivery_buffer` as a derived column via `withColumn()`
+
+### Key Decisions Made
+
+**`delivery_buffer = sla_time_remaining - time_left_to_destination`**
+First business logic signal in the pipeline. Can be negative if SLA is already breached. Defined in `event_schema.md` — Spark implementation matches exactly.
+
+**`temp_headroom` deferred to Phase 3D/3E**
+Would require a one-line addition to `event_schema.md`. Deferred to keep 3C minimal and add it in the phase where it is actually needed for risk tiering logic.
+
+### Phase 3C Complete
+
+First operational signal derived from telemetry. Phase 3D (windowing and watermarking) can begin.
+
+---
+
+## 2026-06-10 — Phase 3E: Risk Tiering & Alert Generation
+
+### What Was Completed
+
+- `spark_streaming/stream_processor.py` finalized with full risk pipeline: `first(sla_buffer_threshold/cargo_temp_threshold)` added to windowed aggregation; deterministic GREEN/YELLOW/RED classification; GREEN filtered out; canonical alert records built with `reason` strings; alerts written to `risk-alerts` Kafka topic
+- `ARCHITECTURE_DECISIONS.md` updated with decisions 7–10 (checkpoint location, duplicate alerts, deterministic event_id, formatting deviations) and Known Issue 1 (YELLOW eclipse)
+
+### Validation Results
+
+- Alerts confirmed in `risk-alerts` topic via Kafka console consumer
+- All 7 canonical alert fields present: `event_id`, `event_ts`, `vehicle_id`, `risk_tier`, `delivery_buffer`, `cargo_temperature`, `reason`
+- GREEN events correctly filtered — only YELLOW/RED reach `risk-alerts`
+- `reason` field populated correctly (e.g. `"Cargo temperature exceeded threshold: 6.48C"`)
+- No errors during execution
+
+### Known Issues
+
+- **YELLOW alerts eclipsed by RED** — 10-minute windows capture ~40 simulator cycles, so `max_cargo_temperature` always reflects RED-level values. YELLOW tier is reachable in theory but invisible in practice. Documented in `ARCHITECTURE_DECISIONS.md` as Known Issue 1. Not blocking Phase 4.
+- **`event_ts` not ISO-8601** — Spark's `.cast("string")` produces `"2026-06-10 21:33:45"` format. Fix deferred to Phase 4.
+- **`reason` float precision** — temperature values emitted at full double precision rather than 2dp. Fix deferred to Phase 4.
+
+### Phase 3 Complete
+
+Full pipeline proven end-to-end: Simulator → Kafka (fleet-telemetry) → Spark → Kafka (risk-alerts). Phase 4 (AI remediation agent) can begin.
