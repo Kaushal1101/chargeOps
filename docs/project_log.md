@@ -192,3 +192,30 @@ Would require a one-line addition to `event_schema.md`. Deferred to keep 3C mini
 ### Phase 3C Complete
 
 First operational signal derived from telemetry. Phase 3D (windowing and watermarking) can begin.
+
+---
+
+## 2026-06-10 — Phase 3E: Risk Tiering & Alert Generation
+
+### What Was Completed
+
+- `spark_streaming/stream_processor.py` finalized with full risk pipeline: `first(sla_buffer_threshold/cargo_temp_threshold)` added to windowed aggregation; deterministic GREEN/YELLOW/RED classification; GREEN filtered out; canonical alert records built with `reason` strings; alerts written to `risk-alerts` Kafka topic
+- `ARCHITECTURE_DECISIONS.md` updated with decisions 7–10 (checkpoint location, duplicate alerts, deterministic event_id, formatting deviations) and Known Issue 1 (YELLOW eclipse)
+
+### Validation Results
+
+- Alerts confirmed in `risk-alerts` topic via Kafka console consumer
+- All 7 canonical alert fields present: `event_id`, `event_ts`, `vehicle_id`, `risk_tier`, `delivery_buffer`, `cargo_temperature`, `reason`
+- GREEN events correctly filtered — only YELLOW/RED reach `risk-alerts`
+- `reason` field populated correctly (e.g. `"Cargo temperature exceeded threshold: 6.48C"`)
+- No errors during execution
+
+### Known Issues
+
+- **YELLOW alerts eclipsed by RED** — 10-minute windows capture ~40 simulator cycles, so `max_cargo_temperature` always reflects RED-level values. YELLOW tier is reachable in theory but invisible in practice. Documented in `ARCHITECTURE_DECISIONS.md` as Known Issue 1. Not blocking Phase 4.
+- **`event_ts` not ISO-8601** — Spark's `.cast("string")` produces `"2026-06-10 21:33:45"` format. Fix deferred to Phase 4.
+- **`reason` float precision** — temperature values emitted at full double precision rather than 2dp. Fix deferred to Phase 4.
+
+### Phase 3 Complete
+
+Full pipeline proven end-to-end: Simulator → Kafka (fleet-telemetry) → Spark → Kafka (risk-alerts). Phase 4 (AI remediation agent) can begin.

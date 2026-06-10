@@ -67,6 +67,12 @@ The **LogiShield Pipeline** is a real-time logistics risk detection system that 
 
 ### Decision 6: Python 3.12 Enforced for Virtual Environment
 
+**Context:** The system default Python version on the development machine was 3.14. The first `pip install -r requirements.txt` run failed during the `pydantic-core` wheel build.
+
+**The Decision:** Create the virtual environment explicitly with `python3.12 -m venv venv`.
+
+**Justification:** `pydantic==2.7.4` depends on `pydantic-core`, which is compiled via PyO3. PyO3 version 0.21.2 only supports up to Python 3.12. Python 3.14 caused a hard build failure. Python 3.12 was already installed on the machine and is the version explicitly targeted in the Phase 1 specification. The project must always be run inside this venv to ensure dependency compatibility.
+
 ---
 
 ### Decision 7: Spark Checkpoint Location at /tmp (Dev Only)
@@ -119,8 +125,19 @@ The **LogiShield Pipeline** is a real-time logistics risk detection system that 
 
 **Implement both in Phase 4** when the alert schema is hardened for AI agent consumption.
 
-**Context:** The system default Python version on the development machine was 3.14. The first `pip install -r requirements.txt` run failed during the `pydantic-core` wheel build.
+---
 
-**The Decision:** Create the virtual environment explicitly with `python3.12 -m venv venv`.
+### Known Issue 1: YELLOW Alerts Eclipsed by RED in Long-Running Windows
 
-**Justification:** `pydantic==2.7.4` depends on `pydantic-core`, which is compiled via PyO3. PyO3 version 0.21.2 only supports up to Python 3.12. Python 3.14 caused a hard build failure. Python 3.12 was already installed on the machine and is the version explicitly targeted in the Phase 1 specification. The project must always be run inside this venv to ensure dependency compatibility.
+**Observed:** During Phase 3E validation, only RED alerts appeared in `risk-alerts`. No YELLOW alerts were produced despite the simulator cycling through YELLOW states.
+
+**Root cause:** The simulator completes a full GREEN→YELLOW→RED cycle every 15 seconds. The aggregation window is 10 minutes wide. Within any 10-minute window, ~40 full cycles occur — meaning every window contains RED-level temperature events. Since `max_cargo_temperature` picks the highest value in the window, even a single RED event pushes the max above the threshold and classifies the entire window as RED. YELLOW events within the same window are eclipsed.
+
+**Impact:** YELLOW tier classification is theoretically correct but practically unreachable in normal operation. The pipeline will produce RED alerts when conditions are dangerous, but the intermediate YELLOW warning stage is effectively invisible.
+
+**Options to address in Phase 4 or beyond:**
+1. Use `avg(cargo_temperature)` instead of `max` — smoother signal, less sensitive to transient spikes
+2. Slow the simulator cycle (e.g. GREEN for 60 steps, YELLOW for 30, RED for 15) so windows capture distinct phases
+3. Separate the temperature and buffer metrics into independent classifiers rather than combining them with `max`
+
+**Not blocking Phase 4** — the AI agent will still receive meaningful RED alerts. Revisit when tuning alert quality.
