@@ -1,4 +1,25 @@
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, from_json
+from pyspark.sql.types import (
+    DoubleType,
+    IntegerType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
+
+TELEMETRY_SCHEMA = StructType([
+    StructField("event_id", StringType(), True),
+    StructField("event_ts", StringType(), True),
+    StructField("vehicle_id", StringType(), True),
+    StructField("cargo_temperature", DoubleType(), True),
+    StructField("time_left_to_destination", IntegerType(), True),
+    StructField("sla_time_remaining", IntegerType(), True),
+    StructField("scenario_state", StringType(), True),
+    StructField("sla_buffer_threshold", IntegerType(), True),
+    StructField("cargo_temp_threshold", DoubleType(), True),
+])
 
 
 def run():
@@ -18,17 +39,37 @@ def run():
         .load()
     )
 
-    projected = raw_stream.selectExpr(
-        "CAST(key AS STRING) AS key",
-        "CAST(value AS STRING) AS value",
-        "topic",
-        "partition",
-        "offset",
-        "timestamp",
+    parsed = raw_stream.select(
+        from_json(col("value").cast("string"), TELEMETRY_SCHEMA).alias("data"),
+        col("topic"),
+        col("partition"),
+        col("offset"),
+        col("timestamp"),
+    )
+
+    structured = parsed.select(
+        col("data.event_id"),
+        col("data.event_ts").cast(TimestampType()).alias("event_ts"),
+        col("data.vehicle_id"),
+        col("data.cargo_temperature"),
+        col("data.time_left_to_destination"),
+        col("data.sla_time_remaining"),
+        col("data.scenario_state"),
+        col("data.sla_buffer_threshold"),
+        col("data.cargo_temp_threshold"),
+        col("topic"),
+        col("partition"),
+        col("offset"),
+        col("timestamp"),
+    )
+
+    with_metrics = structured.withColumn(
+        "delivery_buffer",
+        col("sla_time_remaining") - col("time_left_to_destination"),
     )
 
     query = (
-        projected.writeStream.format("console")
+        with_metrics.writeStream.format("console")
         .outputMode("append")
         .option("truncate", "false")
         .option("numRows", "10")

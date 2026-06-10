@@ -149,3 +149,46 @@ spark-submit \
 ### Phase 3A Complete
 
 Kafka → Spark connectivity proven. Phase 3B can begin.
+
+---
+
+## 2026-06-10 — Phase 3B: Schema Parsing & Structured DataFrames
+
+### What Was Completed
+
+- `spark_streaming/stream_processor.py` updated to parse raw Kafka JSON payloads into typed Spark columns using `from_json()` and an explicit `StructType`
+- `event_ts` cast to `TimestampType` — ready for event-time windowing in Phase 3D
+- Raw `value` column dropped after parsing — redundant once structured columns exist
+- Kafka metadata (`topic`, `partition`, `offset`, `timestamp`) preserved alongside telemetry fields
+
+### Key Decisions Made
+
+**`event_ts` cast to `TimestampType` in 3B, not deferred**
+`event_ts` arrives as an ISO-8601 string. Casting it here avoids a refactor in Phase 3D where it is required as the event-time column for windowing and watermarking.
+
+**Raw `value` column dropped**
+Once `from_json()` extracts structured columns, the original JSON string is redundant and adds noise to every console row.
+
+### Phase 3B Complete
+
+Raw Kafka messages now produce a fully typed Spark DataFrame. Phase 3C can begin.
+
+---
+
+## 2026-06-10 — Phase 3C: Derived Metrics
+
+### What Was Completed
+
+- `spark_streaming/stream_processor.py` updated to compute `delivery_buffer` as a derived column via `withColumn()`
+
+### Key Decisions Made
+
+**`delivery_buffer = sla_time_remaining - time_left_to_destination`**
+First business logic signal in the pipeline. Can be negative if SLA is already breached. Defined in `event_schema.md` — Spark implementation matches exactly.
+
+**`temp_headroom` deferred to Phase 3D/3E**
+Would require a one-line addition to `event_schema.md`. Deferred to keep 3C minimal and add it in the phase where it is actually needed for risk tiering logic.
+
+### Phase 3C Complete
+
+First operational signal derived from telemetry. Phase 3D (windowing and watermarking) can begin.
