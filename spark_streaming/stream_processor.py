@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json
+from pyspark.sql.functions import col, from_json, window, avg, max as spark_max
 from pyspark.sql.types import (
     DoubleType,
     IntegerType,
@@ -68,9 +68,23 @@ def run():
         col("sla_time_remaining") - col("time_left_to_destination"),
     )
 
+    watermarked = with_metrics.withWatermark("event_ts", "5 minutes")
+
+    windowed = (
+        watermarked
+        .groupBy(
+            window(col("event_ts"), "10 minutes", "30 seconds"),
+            col("vehicle_id"),
+        )
+        .agg(
+            avg(col("delivery_buffer")).alias("avg_delivery_buffer"),
+            spark_max(col("cargo_temperature")).alias("max_cargo_temperature"),
+        )
+    )
+
     query = (
-        with_metrics.writeStream.format("console")
-        .outputMode("append")
+        windowed.writeStream.format("console")
+        .outputMode("update")
         .option("truncate", "false")
         .option("numRows", "10")
         .trigger(processingTime="5 seconds")
