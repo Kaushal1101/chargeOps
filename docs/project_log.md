@@ -255,3 +255,47 @@ Clearing `/tmp/logishield-checkpoints/risk-alerts` while Spark is running causes
 ### Phase 4A Complete
 
 Event-time windowing and watermarking validated under disorder. Spark correctly uses `event_ts` as the source of truth regardless of arrival order. Phase 4B (delayed burst replay) can begin.
+
+---
+
+## 2026-06-11 — Simulator & Chaos OOP Refactor
+
+### What Was Completed
+
+- `simulator/simulator.py` refactored to introduce three classes: `Scenario`, `Vehicle`, `Fleet`
+- `chaos/chaos_injector.py` refactored to introduce `ChaosInjector` class
+- Standalone functions `next_scenario()`, `generate_values()`, and `FLEET` dict list removed from `simulator.py`
+
+### Class Responsibilities
+
+| Class | Owns |
+|---|---|
+| `Scenario` | State resolution (`from_step()`), value generation (`generate_values()`) |
+| `Vehicle` | Identity, thresholds, step counter, event construction (`generate_event()`, `advance()`) |
+| `Fleet` | Collection of vehicles (`default()` classmethod, `__iter__`) |
+| `ChaosInjector` | Event timestamp transformation only (`apply_out_of_order()`, `apply_delayed_burst()`) |
+
+### Key Decisions Made
+
+**OOP applied to simulator and chaos components**
+`Scenario`, `Vehicle`, and `Fleet` encapsulate identity, state, and behavior. `ChaosInjector` owns event transformation only — it holds no fleet, producer, topic, or CLI state. This separation keeps each class testable in isolation and makes the chaos modes composable.
+
+**Functional style retained for Spark (`spark_streaming/stream_processor.py`)**
+Spark Structured Streaming pipelines are transformation chains. Wrapping them in a class would add indirection with no benefit — the data flow is already expressed clearly as a sequence of DataFrame operations. OOP was deliberately not applied here.
+
+**`create_producer()` kept as a module-level function**
+It is a stateless factory. A class wrapper would be noise.
+
+**Run loops kept as module-level functions**
+The `run()` function in `simulator.py` and the `run_out_of_order()` / `run_delayed_burst()` functions in `chaos_injector.py` own the producer, fleet, and loop lifecycle. These are coordination concerns, not behavior that belongs on any class.
+
+**`Vehicle.generate_event(event_ts=None)` as the unification point**
+Both normal simulation and chaos modes use the same `generate_event()` method. Normal simulator passes `None` (uses `now()`); chaos injector constructs a backdated `datetime` and passes it in. No special-casing needed in either path.
+
+### Fix Applied During Review
+
+Cursor deviated from the original `generate_values()` ranges in ways that would have broken the risk tiering guarantees:
+- RED: changed to `sla_time_remaining = sla_threshold - randint(5,20)` — delivery_buffer was no longer guaranteed negative
+- YELLOW: switched from percentage-based temperature (`threshold * 0.9`) to absolute subtraction
+
+Corrected to preserve the original relationships: RED always produces negative `delivery_buffer`; YELLOW temperature stays in the `(threshold * 0.9, threshold * 0.95)` band that Spark's YELLOW condition expects.

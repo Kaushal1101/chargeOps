@@ -200,6 +200,29 @@ The AI agent acts as a decision-support layer.
 
 ---
 
+## Implementation Decisions
+
+### OOP in the Simulator and Chaos Layer
+
+`simulator/simulator.py` and `chaos/chaos_injector.py` are structured around classes with clear ownership boundaries:
+
+- **`Scenario`** — resolves scenario state from a step counter and owns value generation for that state.
+- **`Vehicle`** — encapsulates a single truck's identity, thresholds, and step-driven state. Exposes `generate_event(event_ts=None)` as the unified event construction method for both normal and chaos paths.
+- **`Fleet`** — a collection wrapper with a `default()` classmethod. Does not own publishing.
+- **`ChaosInjector`** — owns event timestamp transformation only (`apply_out_of_order`, `apply_delayed_burst`). Holds no fleet, producer, topic, or CLI state, making each chaos mode independently testable.
+
+Run loops, the Kafka producer factory (`create_producer()`), and CLI entry points (`main()`) are kept as module-level functions. These are coordination concerns, not behavior that belongs on a class.
+
+### Functional Style in Spark
+
+`spark_streaming/stream_processor.py` is written in a purely functional style — a sequential chain of DataFrame transformations with no wrapping classes. Spark Structured Streaming is inherently functional: each operation returns a new DataFrame and the pipeline is expressed most clearly as a linear transformation chain. Adding a class would obscure the data flow without adding testability or isolation benefits.
+
+### Chaos as Event Transformation
+
+The chaos injector does not extend or modify vehicle or fleet behavior. Instead, `ChaosInjector` methods accept a `TelemetryEvent` and return a new `TelemetryEvent` with a modified timestamp. This keeps chaos logic isolated from simulation logic — the same fleet and vehicle classes power both normal and chaos runs without modification.
+
+---
+
 ## Future Enhancements
 
 - Live operational dashboard
