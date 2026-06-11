@@ -74,26 +74,13 @@ This is the correct mechanism for testing Spark's watermark boundary. Spark assi
 - Phase 4A applied a *random* offset per event (disorder simulation)
 - Phase 4B applies a *fixed* offset to all events in the burst (outage simulation)
 
-**Burst size:** 90 events per run — 30 steps × 3 trucks. This represents approximately 30 seconds of telemetry from all three trucks, which is enough for Spark to see meaningful window data from the burst.
-
----
-
-# Pre-Run Requirement: Stop the Normal Simulator
-
-**The normal simulator must NOT be running during Phase 4B tests.**
-
-If the normal simulator is running, it will continuously publish fresh events to `fleet-telemetry`. Spark's watermark will keep advancing with those fresh events, making the backdated burst events look progressively older relative to the watermark. This contaminates the test.
-
-For a clean watermark boundary test:
-1. Ensure the simulator is stopped
-2. Run the Spark job alone (its watermark will stall without incoming events)
-3. Then fire the delayed burst — Spark's watermark reflects only the burst timestamps
+**Burst size:** 30 events per run — 30 steps for the target vehicle. Only one vehicle is burst; the other two trucks continue sending live telemetry via the normal simulator, which keeps Spark's watermark advancing throughout the test.
 
 ---
 
 # Delay Scenarios
 
-All four scenarios use the same 90-event burst. Only `--delay` changes.
+All four scenarios use the same 30-event burst targeting TRUCK_101. Only `--delay` changes.
 
 | Scenario | `--delay` | Expected Behavior |
 |----------|-----------|-------------------|
@@ -106,9 +93,15 @@ All four scenarios use the same 90-event burst. Only `--delay` changes.
 
 # How to Run
 
-**Step 1 — Ensure simulator is stopped.** No `python -m simulator.simulator` should be running.
+**Step 1 — Start the normal simulator** (Terminal 1):
+```bash
+source venv/bin/activate
+python -m simulator.simulator
+```
 
-**Step 2 — Clear checkpoint and start Spark:**
+The normal simulator keeps publishing fresh events, which advances Spark's watermark throughout the test. TRUCK_101 also publishes normal telemetry while the burst events arrive in parallel via the chaos injector.
+
+**Step 2 — Clear checkpoint and start Spark** (Terminal 2):
 ```bash
 rm -rf /tmp/logishield-checkpoints/risk-alerts
 source venv/bin/activate
@@ -118,22 +111,22 @@ spark-submit \
   spark_streaming/stream_processor.py
 ```
 
-**Step 3 — Run each scenario in a separate terminal. Clear the checkpoint and restart Spark between scenarios.**
+**Step 3 — Run each burst scenario in a separate terminal. Clear the checkpoint and restart Spark between scenarios.**
 
 ```bash
 source venv/bin/activate
 
 # Small delay (2 min)
-python -m chaos.chaos_injector --mode delayed_burst --delay 120
+python -m chaos.chaos_injector --mode delayed_burst --delay 120 --vehicle TRUCK_101
 
 # Near-boundary (4 min)
-python -m chaos.chaos_injector --mode delayed_burst --delay 240
+python -m chaos.chaos_injector --mode delayed_burst --delay 240 --vehicle TRUCK_101
 
 # Over-boundary (7 min)
-python -m chaos.chaos_injector --mode delayed_burst --delay 420
+python -m chaos.chaos_injector --mode delayed_burst --delay 420 --vehicle TRUCK_101
 
 # Extreme (20 min)
-python -m chaos.chaos_injector --mode delayed_burst --delay 1200
+python -m chaos.chaos_injector --mode delayed_burst --delay 1200 --vehicle TRUCK_101
 ```
 
 **Between each scenario:**
@@ -153,9 +146,9 @@ Same as Phase 4A — no console sink. Observe via:
 - Over-boundary and extreme delays should produce fewer or no alerts
 
 **Spark UI** (`http://localhost:4040` → Streaming tab):
-- Watch the watermark timestamp — with no normal simulator running, it will stall
-- When the burst arrives, watch whether the watermark advances or the events are dropped
-- Input rate will spike during the burst then drop to zero after it completes
+- The watermark advances continuously throughout the test, driven by TRUCK_102 and TRUCK_103's live events
+- When the burst arrives, watch whether TRUCK_101's backdated events are accepted or dropped relative to the current watermark
+- Input rate will spike briefly during the burst then return to baseline
 
 ---
 
@@ -173,7 +166,7 @@ Same as Phase 4A — no console sink. Observe via:
 # Validation Checklist
 
 - [ ] `delayed_burst` mode added to `chaos/chaos_injector.py`
-- [ ] Normal simulator is stopped before each run
+- [ ] Normal simulator is running during each burst scenario
 - [ ] Small delay (120s): alerts appear in `risk-alerts`
 - [ ] Near-boundary (240s): alerts appear, edge behavior observed
 - [ ] Over-boundary (420s): watermark drops events, stream remains stable
