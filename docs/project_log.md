@@ -219,3 +219,39 @@ First operational signal derived from telemetry. Phase 3D (windowing and waterma
 ### Phase 3 Complete
 
 Full pipeline proven end-to-end: Simulator → Kafka (fleet-telemetry) → Spark → Kafka (risk-alerts). Phase 4 (AI remediation agent) can begin.
+
+---
+
+## 2026-06-11 — Phase 4A: Out-of-Order Event Validation
+
+### What Was Completed
+
+- `chaos/__init__.py` — package marker
+- `chaos/chaos_injector.py` — out-of-order chaos mode via timestamp backdating, with `--mode` and `--delay` CLI flags
+- `docs/phases/phase_4/phase_4a.md` — plan with mechanism definition, disorder progression, observation method, and run commands
+- All three disorder passes executed and validated
+
+### Key Decisions Made
+
+**Timestamp backdating as the out-of-order mechanism**
+Events arrive in Kafka in normal order but with `event_ts` shifted backwards by a random offset within the configured delay range. This directly exercises Spark's event-time logic — Spark assigns events to windows based solely on `event_ts`, not arrival order.
+
+**Checkpoint must be cleared only after Spark is stopped**
+Clearing `/tmp/logishield-checkpoints/risk-alerts` while Spark is running causes `HDFSStateStore` failures as Spark tries to commit to deleted state files. Correct procedure: kill Spark first, then clear checkpoint, then restart.
+
+### Validation Results
+
+| Pass | Delay Range | Result |
+|------|-------------|--------|
+| Slight | ±1 min | All events accepted, alerts flowing normally |
+| Moderate | ±3 min | All events accepted, within 5-min watermark boundary |
+| Heavy | ±7 min | Spark correctly dropped events exceeding watermark, stream remained stable |
+
+- Spark UI at `localhost:4040` confirmed watermark advancing in real time
+- Heavy pass confirmed watermark drop behavior — events with `event_ts` older than `current_time - 5min` were silently excluded from windows
+- No crashes or processing errors across any pass
+- Spark batch duration remained stable throughout
+
+### Phase 4A Complete
+
+Event-time windowing and watermarking validated under disorder. Spark correctly uses `event_ts` as the source of truth regardless of arrival order. Phase 4B (delayed burst replay) can begin.
