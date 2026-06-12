@@ -299,3 +299,46 @@ Cursor deviated from the original `generate_values()` ranges in ways that would 
 - YELLOW: switched from percentage-based temperature (`threshold * 0.9`) to absolute subtraction
 
 Corrected to preserve the original relationships: RED always produces negative `delivery_buffer`; YELLOW temperature stays in the `(threshold * 0.9, threshold * 0.95)` band that Spark's YELLOW condition expects.
+
+---
+
+## 2026-06-12 — Phase 4B: Delayed Burst Replay
+
+### What Was Completed
+
+- `chaos/chaos_injector.py` updated with `delayed_burst` mode — 30 events sent instantly with `event_ts` backdated by a fixed offset
+- `--vehicle` flag added so any truck can be targeted
+- All four delay scenarios executed and validated
+
+### Validation Results
+
+| Scenario | `--delay` | Rows Dropped by Watermark | Result |
+|----------|-----------|--------------------------|--------|
+| Small | 120s | 0 | All events accepted, alerts appeared in `risk-alerts` |
+| Near-boundary | 240s | 0 | All events accepted, within 5-min watermark |
+| Over-boundary | 420s | ~4 | Some events dropped, stream remained stable |
+| Extreme | 1200s | ~20 of 30 | Most events dropped, stream remained healthy |
+
+### Key Observations
+
+**Burst mechanism is timestamp backdating, not actual sleep**
+Events are sent to Kafka instantly. The "delay" is applied solely to `event_ts`. Spark uses `event_ts` for watermark decisions — this is the correct way to simulate a connectivity outage without waiting real time.
+
+**Watermark warm-up: the most important insight from this phase**
+In the 1200s scenario, 10 of 30 burst events were accepted despite being 20 minutes old. This is expected Spark behavior:
+- Spark updates the watermark at the **end** of each micro-batch, and applies it to the **next** batch
+- On a fresh start (after checkpoint clear), the watermark begins at epoch (effectively 0)
+- The first micro-batches process events before the watermark has advanced enough to reject stale events
+- Once TRUCK_102/103's live events push the watermark past `now - 5 min`, the remaining burst events are correctly dropped
+
+Analogy: a nightclub bouncer who only lets people in from the last 5 minutes, but has no reference point when the club first opens — he lets the first arrivals in regardless of their ID timestamp, then enforces the rule once he knows what "now" is.
+
+**Implication for production systems:** watermark-based filtering cannot be relied upon immediately after a stream restart. There is a warm-up window during which late events may slip through. This is a known Spark design characteristic, not a bug.
+
+### No Crashes or Stream Failures
+
+Spark remained stable across all four scenarios. Input rate spiked briefly during each burst then returned to the normal simulator's baseline. Watermark continued advancing throughout, driven by TRUCK_102 and TRUCK_103.
+
+### Phase 4B Complete
+
+Watermark boundary behavior validated under delayed burst conditions. Spark correctly separates acceptable lateness from stale events once the watermark is established. Phase 4C can begin.
