@@ -92,18 +92,60 @@ def run_delayed_burst(
     )
 
 
+def run_packet_loss(loss_rate: float) -> None:
+    fleet = Fleet.default()
+    producer = create_producer()
+    generated = 0
+    sent = 0
+
+    try:
+        while True:
+            for vehicle in fleet:
+                event = vehicle.generate_event()
+                generated += 1
+
+                if random.random() < loss_rate:
+                    print(
+                        f"[{vehicle.vehicle_id}] DROPPED | {vehicle.current_scenario().state}"
+                    )
+                else:
+                    producer.send(
+                        TOPIC,
+                        key=vehicle.vehicle_id.encode(),
+                        value=event.to_json_bytes(),
+                    )
+                    sent += 1
+                    print(
+                        f"[{vehicle.vehicle_id}] {vehicle.current_scenario().state} | event_ts={event.event_ts}"
+                    )
+
+                vehicle.advance()
+
+            producer.flush()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        producer.flush()
+        producer.close()
+        dropped = generated - sent
+        actual_loss_rate = (dropped / generated * 100) if generated > 0 else 0.0
+        print("\nPacket loss summary")
+        print(f"Events generated : {generated}")
+        print(f"Events sent      : {sent}")
+        print(f"Events dropped   : {dropped}")
+        print(f"Actual loss rate : {actual_loss_rate:.1f}%")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
         type=str,
         required=True,
-        choices=["out_of_order", "delayed_burst"],
+        choices=["out_of_order", "delayed_burst", "packet_loss"],
     )
     parser.add_argument(
         "--delay",
         type=int,
-        required=True,
         help="Max backdate offset in seconds",
     )
     parser.add_argument(
@@ -112,12 +154,25 @@ def main() -> None:
         default="TRUCK_101",
         help="Vehicle ID to target for delayed burst (default: TRUCK_101)",
     )
+    parser.add_argument(
+        "--loss-rate",
+        type=float,
+        help="Fraction of events to drop (0.0-1.0)",
+    )
     args = parser.parse_args()
 
     if args.mode == "out_of_order":
+        if args.delay is None:
+            parser.error("--delay is required for out_of_order mode")
         run_out_of_order(args.delay)
     elif args.mode == "delayed_burst":
+        if args.delay is None:
+            parser.error("--delay is required for delayed_burst mode")
         run_delayed_burst(args.delay, args.vehicle)
+    elif args.mode == "packet_loss":
+        if args.loss_rate is None:
+            parser.error("--loss-rate is required for packet_loss mode")
+        run_packet_loss(args.loss_rate)
 
 
 if __name__ == "__main__":

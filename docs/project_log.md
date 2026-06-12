@@ -342,3 +342,43 @@ Spark remained stable across all four scenarios. Input rate spiked briefly durin
 ### Phase 4B Complete
 
 Watermark boundary behavior validated under delayed burst conditions. Spark correctly separates acceptable lateness from stale events once the watermark is established. Phase 4C can begin.
+
+---
+
+## 2026-06-12 — Phase 4C: Packet Loss Simulation
+
+### What Was Completed
+
+- `chaos/chaos_injector.py` updated with `packet_loss` mode
+- `--loss-rate` float flag added to CLI (e.g. `--loss-rate 0.15` for 15%)
+- `--delay` made optional and guarded per mode with `parser.error()` — consistent with `--loss-rate`
+- Packet drops confirmed via terminal output across all three loss rates
+
+### Validation Results
+
+| Scenario | `--loss-rate` | Result |
+|----------|--------------|--------|
+| Light | 0.03 | DROPPED lines visible, stream looks nearly normal |
+| Moderate | 0.05 | Missing samples begin to appear |
+| Heavy | 0.15 | Meaningful drop rate confirmed in summary output |
+
+### Key Design Decisions
+
+**Packet loss is not tested against Spark in this phase**
+The goal is to confirm that events are being dropped before reaching Kafka, not to observe Spark's reaction. Spark handles variable input rates gracefully — it processes whatever arrives in each micro-batch and does not crash from reduced throughput.
+
+**The real risk of packet loss is silent data quality degradation, not instability**
+Spark keeps running and alerts keep flowing, but risk classifications may be based on incomplete data. If dropped events happen to be the RED-state events, the pipeline produces a false YELLOW or no alert — with no error or indication that data was missing. This is a harder failure mode to detect than a crash.
+
+**Watermark stalling is only a risk at extreme loss rates (near 100%)**
+At 10-15% loss, enough events arrive to keep the watermark advancing. At near-total loss, the watermark would freeze, windows would never close, and state would accumulate until OOM. Not a concern at the rates tested.
+
+**Drop logic is inline, not on the ChaosInjector class**
+One `random.random() < loss_rate` check before `producer.send()`. No class method warranted for a single conditional.
+
+**vehicle.advance() always runs regardless of drop**
+The vehicle's internal state progresses even when an event is dropped. Packet loss doesn't freeze the truck — it just means that step's telemetry never reached Kafka.
+
+### Phase 4C Complete
+
+Packet loss mechanism confirmed working. Events are randomly dropped before Kafka publication at the configured rate, with a summary printed on exit. Phase 4D (fleet scaling and throughput benchmarking) can begin.
