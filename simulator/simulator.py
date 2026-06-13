@@ -1,3 +1,4 @@
+import argparse
 import random
 import time
 import uuid
@@ -101,6 +102,19 @@ class Fleet:
             ]
         )
 
+    @classmethod
+    def scaled(cls, n: int) -> "Fleet":
+        return cls(
+            [
+                Vehicle(
+                    f"TRUCK_{i:04d}",
+                    round(random.uniform(4.5, 6.0), 1),
+                    random.randint(25, 40),
+                )
+                for i in range(1, n + 1)
+            ]
+        )
+
     def __iter__(self):
         return iter(self.vehicles)
 
@@ -117,12 +131,13 @@ def create_producer() -> KafkaProducer:
         raise
 
 
-def run() -> None:
-    fleet = Fleet.default()
+def run(fleet_size: int) -> None:
+    fleet = Fleet.scaled(fleet_size)
     producer = create_producer()
 
     try:
         while True:
+            start = time.time()
             for vehicle in fleet:
                 event = vehicle.generate_event()
                 producer.send(
@@ -136,12 +151,25 @@ def run() -> None:
                 vehicle.advance()
 
             producer.flush()
-            time.sleep(1)
+            elapsed = time.time() - start
+            time.sleep(max(0.0, 1.0 - elapsed))
     except KeyboardInterrupt:
         print("Simulator stopped.")
         producer.flush()
         producer.close()
 
 
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--fleet-size",
+        type=int,
+        default=3,
+        help="Number of vehicles in fleet (default: 3)",
+    )
+    args = parser.parse_args()
+    run(args.fleet_size)
+
+
 if __name__ == "__main__":
-    run()
+    main()

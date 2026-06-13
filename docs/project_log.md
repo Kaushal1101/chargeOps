@@ -382,3 +382,30 @@ The vehicle's internal state progresses even when an event is dropped. Packet lo
 ### Phase 4C Complete
 
 Packet loss mechanism confirmed working. Events are randomly dropped before Kafka publication at the configured rate, with a summary printed on exit. Phase 4D (fleet scaling and throughput benchmarking) can begin.
+
+---
+
+## 2026-06-13 — Phase 4D: Fleet Scaling
+
+### What Was Completed
+
+- `simulator/simulator.py` updated with `Fleet.scaled(n)` classmethod and `--fleet-size` CLI flag
+- `run()` updated with time-compensated sleep: `sleep(max(0.0, 1.0 - elapsed))`
+- `main()` added with argparse entry point
+- `chaos/chaos_injector.py` updated to use `Fleet.scaled(3)` in all three run functions for consistency
+- Default `--vehicle` for `delayed_burst` updated from `TRUCK_101` to `TRUCK_0001`
+- 20-truck fleet validated locally
+
+### Key Decisions Made
+
+**`Fleet.scaled(n)` added alongside `Fleet.default()`**
+`Fleet.default()` was not removed — it would have silently broken the chaos injector. `Fleet.scaled(n)` generates N vehicles with auto-incremented IDs (`TRUCK_0001`...`TRUCK_N`) and randomised thresholds within the same operational ranges as the original fleet.
+
+**Vehicle ID format change: TRUCK_101 → TRUCK_0001**
+`Fleet.scaled()` uses a 4-digit zero-padded format. The chaos injector was updated to match so all components use the same vehicle ID scheme. The old 3-digit IDs (TRUCK_101/102/103) no longer appear anywhere.
+
+**Time-compensated sleep**
+`sleep(1)` replaced with `sleep(max(0.0, 1.0 - elapsed))`. At small fleet sizes the difference is negligible. At large fleet sizes (500+) the loop itself takes meaningful time and the fixed sleep would cause each vehicle's rate to drift below 1 event/sec. The compensated version keeps the per-vehicle rate accurate regardless of fleet size.
+
+**`run()` now always calls `Fleet.scaled()`**
+The default of `--fleet-size 3` produces the same 3-vehicle behaviour as before, just with TRUCK_0001/0002/0003 instead of TRUCK_101/102/103.

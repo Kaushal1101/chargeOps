@@ -35,7 +35,7 @@ class ChaosInjector:
 
 
 def run_out_of_order(delay_seconds: int) -> None:
-    fleet = Fleet.default()
+    fleet = Fleet.scaled(3)
     producer = create_producer()
     injector = ChaosInjector()
 
@@ -63,9 +63,9 @@ def run_out_of_order(delay_seconds: int) -> None:
 
 
 def run_delayed_burst(
-    delay_seconds: int, burst_vehicle_id: str = "TRUCK_101"
+    delay_seconds: int, burst_vehicle_id: str = "TRUCK_0001"
 ) -> None:
-    fleet = Fleet.default()
+    fleet = Fleet.scaled(3)
     producer = create_producer()
     injector = ChaosInjector()
     burst_steps = 30
@@ -93,7 +93,7 @@ def run_delayed_burst(
 
 
 def run_packet_loss(loss_rate: float) -> None:
-    fleet = Fleet.default()
+    fleet = Fleet.scaled(3)
     producer = create_producer()
     generated = 0
     sent = 0
@@ -152,7 +152,7 @@ def main() -> None:
         "--vehicle",
         type=str,
         default="TRUCK_101",
-        help="Vehicle ID to target for delayed burst (default: TRUCK_101)",
+        help="Vehicle ID to target for delayed burst (default: TRUCK_0001)",
     )
     parser.add_argument(
         "--loss-rate",
