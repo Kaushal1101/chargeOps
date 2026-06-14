@@ -1,5 +1,6 @@
 import argparse
 import random
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -131,32 +132,53 @@ def create_producer() -> KafkaProducer:
         raise
 
 
+def worker(shard: list[Vehicle], producer: KafkaProducer, stop: threading.Event) -> None:
+    while not stop.is_set():
+        start = time.time()
+        for vehicle in shard:
+            event = vehicle.generate_event()
+            producer.send(
+                TOPIC,
+                key=vehicle.vehicle_id.encode(),
+                value=event.to_json_bytes(),
+            )
+            print(
+                f"[{vehicle.vehicle_id}] {vehicle.current_scenario().state} | event_ts={event.event_ts}"
+            )
+            vehicle.advance()
+        elapsed = time.time() - start
+        stop.wait(max(0.0, 1.0 - elapsed))
+
+
 def run(fleet_size: int) -> None:
+    num_threads = 4
     fleet = Fleet.scaled(fleet_size)
     producer = create_producer()
+    stop = threading.Event()
+
+    vehicles = list(fleet)
+    shards = [vehicles[i::num_threads] for i in range(num_threads)]
+
+    threads = [
+        threading.Thread(target=worker, args=(shard, producer, stop), daemon=True)
+        for shard in shards
+        if shard
+    ]
+
+    for t in threads:
+        t.start()
 
     try:
-        while True:
-            start = time.time()
-            for vehicle in fleet:
-                event = vehicle.generate_event()
-                producer.send(
-                    TOPIC,
-                    key=vehicle.vehicle_id.encode(),
-                    value=event.to_json_bytes(),
-                )
-                print(
-                    f"[{vehicle.vehicle_id}] {vehicle.current_scenario().state} | event_ts={event.event_ts}"
-                )
-                vehicle.advance()
-
-            producer.flush()
-            elapsed = time.time() - start
-            time.sleep(max(0.0, 1.0 - elapsed))
+        for t in threads:
+            t.join()
     except KeyboardInterrupt:
-        print("Simulator stopped.")
+        print("Shutting down simulator...")
+        stop.set()
+        for t in threads:
+            t.join()
         producer.flush()
         producer.close()
+        print("Simulator stopped.")
 
 
 def main() -> None:
