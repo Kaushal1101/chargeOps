@@ -409,3 +409,34 @@ Packet loss mechanism confirmed working. Events are randomly dropped before Kafk
 
 **`run()` now always calls `Fleet.scaled()`**
 The default of `--fleet-size 3` produces the same 3-vehicle behaviour as before, just with TRUCK_0001/0002/0003 instead of TRUCK_101/102/103.
+
+### Scale Test Results
+
+| Fleet Size | Input Rate (events/sec) | Processing Rate (events/sec) | Batch Pattern |
+|------------|------------------------|------------------------------|---------------|
+| 100 | ~90 | ~600 | 1-second bursts |
+| 500 | ~400 | ~900 | 1-second bursts |
+| 1000 | ~900 | ~1500 | 1-second bursts |
+| 10000 | ~2000 (ceiling) | ~3000 | Continuous stream |
+
+### Bottleneck Finding
+
+**The Python simulator saturates at ~2,000 events/sec. Spark never became the bottleneck.**
+
+At 10,000 trucks the simulator loop takes longer than 1 second, so `max(0.0, 1.0 - elapsed)` hits 0 and the simulator runs flat out. Python's single-threaded GIL and sequential loop caps throughput at ~2,000 events/sec — not Kafka, not Spark.
+
+Spark's processing rate (3,000 events/sec) stayed above input rate (2,000 events/sec) even at maximum simulator throughput. The pipeline has more headroom than the simulator can exercise.
+
+**Load pattern shifts at scale**
+Up to ~1,000 trucks, events arrive in discrete 1-second bursts — all N events land at once, then Spark has idle time before the next cycle. At 10,000 trucks the loop never sleeps, producing a continuous stream with no idle gaps. These are fundamentally different load profiles. The burst pattern is easier for Spark because it gets breathing room between batches.
+
+**Kafka showed no stress at any fleet size tested.**
+The Python simulator saturated before Kafka had any chance to become constrained.
+
+### Known Limitation
+
+To find Spark's true throughput ceiling, a faster event source is needed — a multi-threaded or multi-process Python producer, or a JVM-based producer. Improving the simulator to push past 2,000 events/sec is deferred to a future phase.
+
+### Phase 4D Complete
+
+Fleet scaling validated up to the simulator's throughput ceiling. The pipeline architecture (Kafka + Spark Structured Streaming) has demonstrated headroom beyond what the current Python simulator can exercise. Phase 4E (benchmarking and performance analysis) can begin.
