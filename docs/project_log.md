@@ -519,3 +519,40 @@ Python is no longer the simulator bottleneck. The threading refactor pushed the 
 The Python diagnostic improvement (+157%) confirms that the previous ceiling was largely producer back-pressure — `linger_ms=0` was causing 10,000 individual produce requests per second to the broker. Batching with `linger_ms=10` reduced that dramatically.
 
 Spark input rate improvement is smaller (+32%) because the broker is still handling dual produce/consume load on a single node. Partition count is the next variable to address.
+
+### Step 2 — Partition Increase
+
+Both `fleet-telemetry` and `risk-alerts` increased from 3 partitions to 12.
+
+Rationale: 3 partitions was designed for the original 3-truck fleet. At 10,000+ trucks, funnelling all produce and consume traffic through 3 partitions creates per-partition contention at the broker. 12 partitions is divisible by 4 (producer threads) and provides more parallel tasks for Spark's `local[*]` executor.
+
+`docker-compose.yml` updated to recreate topics at 12 partitions on fresh stack startup.
+
+**Results after partition increase:**
+
+| Metric | After producer tuning | After partition increase |
+|--------|----------------------|--------------------------|
+| Python diagnostic ev/s | ~7,700 | ~11,000 |
+| Spark input rate | ~3,300 | ~2,700 |
+
+Spark input rate did not improve meaningfully from the partition increase. The bottleneck has moved.
+
+### Final Bottleneck Finding
+
+**Spark is now the bottleneck — not Kafka.**
+
+With producer tuning in place, Python generates 11,000 ev/s and Kafka accepts all of it (no back-pressure on the producer). Kafka then stores the messages and waits. Spark pulls from Kafka at 2,700 ev/s — not because Kafka is slow at delivering, but because Spark is a pull-based consumer that requests the next batch only after finishing the current one.
+
+Spark's 2,700 ev/s ceiling is determined by how long each micro-batch takes: JSON parsing, sliding window aggregations, stateful watermarking, and risk tiering for 10,000 trucks on a shared MacBook Air. Kafka is doing exactly what it should — buffering the gap between a fast producer and a slower consumer.
+
+**Bottleneck progression across phases:**
+
+| Phase | Bottleneck | Ceiling |
+|-------|-----------|---------|
+| Phase 4D | Python sequential loop | ~2,000 ev/s |
+| Phase 5A | Kafka broker (dual load, no batching) | ~3,000 ev/s |
+| Phase 5B | Spark processing (windowing, state, parsing) | ~2,700 ev/s consumed |
+
+### Phase 5B Complete
+
+Kafka is no longer the ceiling. Python generates 11,000 ev/s, Kafka buffers successfully, and Spark consumes at its own processing pace (~2,700 ev/s). The pipeline is now correctly structured with Kafka acting as the decoupling buffer between a fast producer and a throughput-bound stream processor.

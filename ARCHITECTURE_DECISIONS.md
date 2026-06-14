@@ -127,6 +127,46 @@ The **LogiShield Pipeline** is a real-time logistics risk detection system that 
 
 ---
 
+### Decision 11: Threaded Simulator with Fleet Sharding (Phase 5A)
+
+**Context:** The sequential simulator loop bottlenecked at ~2,000 events/sec in Phase 4D — Python's GIL and single-threaded iteration over the fleet was the ceiling, not Kafka or Spark.
+
+**The Decision:** Replace the single loop with 4 worker threads, each owning a deterministic round-robin shard of the fleet (`vehicles[i::4]`). A single shared `KafkaProducer` is used across all threads. A `threading.Event` stop flag replaces `time.sleep()` in worker loops so threads wake immediately on shutdown.
+
+**Justification:** Kafka sends are I/O-bound, not CPU-bound — threads help despite the GIL because each thread spends most of its time waiting on the producer's internal buffer, not computing. One producer per process is correct: `kafka-python-ng`'s `KafkaProducer` is thread-safe and batches more efficiently with a single shared buffer than with one producer per thread. `stop.wait(timeout)` instead of `time.sleep()` is critical for responsive shutdown — without it, Ctrl+C leaves threads sleeping for up to 1 second before they can exit.
+
+**Result:** Standalone Python ceiling increased from ~2,000 ev/s to ~10,500 ev/s (5x improvement).
+
+---
+
+### Decision 12: Kafka Producer Tuning — Batching, Buffer, and LZ4 Compression (Phase 5B)
+
+**Context:** After threading, the full pipeline (Python + Kafka + Spark) plateaued at ~3,000 ev/s. Python diagnostic and Spark input rate were at the same ceiling, meaning Kafka back-pressure was throttling the producer down to Spark's speed. The default `linger_ms=0` was causing ~10,000 individual produce requests per second to the broker.
+
+**The Decision:** Set `linger_ms=10`, `batch_size=65536`, `buffer_memory=67108864`, and `compression_type="lz4"` on the shared producer.
+
+**Justification:**
+- `linger_ms=10` allows messages to accumulate for 10ms before sending, reducing broker request count by ~100x at high throughput
+- `batch_size=65536` (64KB) allows larger batches to form, amortising per-request overhead
+- `buffer_memory=67108864` (64MB, doubled from default) reduces the frequency of back-pressure blocking under load
+- `lz4` chosen over `snappy` — both are fast low-overhead compressors; lz4 installed cleanly via pip while snappy's native dependency failed to download. JSON telemetry payloads compress well (~291 bytes → ~150 bytes), reducing broker I/O
+
+**Result:** Python diagnostic under full pipeline load increased from ~3,000 ev/s to ~7,700 ev/s. Spark input rate increased from ~2,500 to ~3,300 ev/s.
+
+---
+
+### Decision 13: Topic Partition Count Increased from 3 to 12 (Phase 5B)
+
+**Context:** `fleet-telemetry` and `risk-alerts` were created with 3 partitions — designed for the original 3-truck fleet. At 10,000+ trucks with 4 producer threads, all traffic was funnelled through 3 partitions, creating per-partition contention at the broker.
+
+**The Decision:** Increase both topics to 12 partitions. `docker-compose.yml` kafka-init updated to create topics at 12 partitions on fresh stack startup.
+
+**Justification:** 12 is divisible by 4 (producer threads), allowing each thread to target a distinct set of partitions. It also provides more parallel read tasks for Spark's `local[*]` executor. Topics were deleted and recreated (rather than altered in place) to purge accumulated messages from earlier test runs which were causing Spark to fall behind on a large backlog.
+
+**Result:** Partition increase did not materially improve Spark input rate (~2,700 ev/s) — confirming the bottleneck had moved from Kafka to Spark's processing capacity, not partition contention. The decision is still correct: 3 partitions was under-provisioned for the current scale and would have become a bottleneck at higher Spark throughput.
+
+---
+
 ### Known Issue 1: YELLOW Alerts Eclipsed by RED in Long-Running Windows
 
 **Observed:** During Phase 3E validation, only RED alerts appeared in `risk-alerts`. No YELLOW alerts were produced despite the simulator cycling through YELLOW states.
