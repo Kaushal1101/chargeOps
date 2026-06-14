@@ -126,6 +126,10 @@ def create_producer() -> KafkaProducer:
             bootstrap_servers="localhost:9093",
             value_serializer=lambda v: v,
             retries=3,
+            linger_ms=10,
+            batch_size=65536,
+            buffer_memory=67108864,
+            compression_type="lz4",
         )
     except KafkaError as e:
         print(f"Failed to connect to Kafka at localhost:9093: {e}")

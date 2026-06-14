@@ -490,4 +490,32 @@ The key evidence: without Spark running, Python generates 10,000 ev/s. With Spar
 
 ### Phase 5A Complete
 
-Python is no longer the simulator bottleneck. The threading refactor pushed the standalone ceiling from 2,000 to ~10,500 ev/s. Under full pipeline load, the constraint is the local Kafka broker at ~3,000 msg/sec. Phase 5B (per-vehicle cadence and scheduling abstraction) can begin.
+Python is no longer the simulator bottleneck. The threading refactor pushed the standalone ceiling from 2,000 to ~10,500 ev/s. Under full pipeline load, the constraint is the local Kafka broker at ~3,000 msg/sec. Phase 5B (Kafka bottleneck mitigation) can begin.
+
+---
+
+## 2026-06-14 — Phase 5B: Kafka Bottleneck Mitigation
+
+### Step 1 — Producer Tuning
+
+**Settings applied:**
+
+| Parameter | Old (default) | New |
+|-----------|--------------|-----|
+| `linger_ms` | 0 | 10 |
+| `batch_size` | 16,384 | 65,536 |
+| `buffer_memory` | 33,554,432 | 67,108,864 |
+| `compression_type` | None | lz4 |
+
+`lz4` used instead of `snappy` — snappy native library failed to download due to network timeout. lz4 is marginally faster than snappy at equivalent compression ratios and installed cleanly via pip.
+
+**Results after producer tuning:**
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| Python diagnostic ev/s (full pipeline) | ~3,000 | ~7,700 | +157% |
+| Spark input rate | ~2,500 | ~3,300 | +32% |
+
+The Python diagnostic improvement (+157%) confirms that the previous ceiling was largely producer back-pressure — `linger_ms=0` was causing 10,000 individual produce requests per second to the broker. Batching with `linger_ms=10` reduced that dramatically.
+
+Spark input rate improvement is smaller (+32%) because the broker is still handling dual produce/consume load on a single node. Partition count is the next variable to address.
