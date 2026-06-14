@@ -132,11 +132,36 @@ def create_producer() -> KafkaProducer:
         raise
 
 
+# === DIAGNOSTIC: event-generation rate counter (temporary; remove this block to disable) ===
+_event_count = 0
+_event_count_lock = threading.Lock()
+
+
+def _record_event() -> None:
+    global _event_count
+    with _event_count_lock:
+        _event_count += 1
+
+
+def _rate_reporter(stop: threading.Event, interval: float = 5.0) -> None:
+    global _event_count
+    while not stop.wait(interval):
+        with _event_count_lock:
+            count = _event_count
+            _event_count = 0
+        print(
+            f"[DIAGNOSTIC] generated {count} events in {interval:.1f}s "
+            f"({count / interval:.1f} ev/s)"
+        )
+# === END DIAGNOSTIC ===
+
+
 def worker(shard: list[Vehicle], producer: KafkaProducer, stop: threading.Event) -> None:
     while not stop.is_set():
         start = time.time()
         for vehicle in shard:
             event = vehicle.generate_event()
+            _record_event()  # DIAGNOSTIC
             producer.send(
                 TOPIC,
                 key=vehicle.vehicle_id.encode(),
@@ -164,6 +189,9 @@ def run(fleet_size: int) -> None:
         for shard in shards
         if shard
     ]
+
+    # DIAGNOSTIC: start event-rate reporter
+    threading.Thread(target=_rate_reporter, args=(stop,), daemon=True).start()
 
     for t in threads:
         t.start()

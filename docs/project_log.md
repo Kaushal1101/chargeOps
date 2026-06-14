@@ -439,4 +439,55 @@ To find Spark's true throughput ceiling, a faster event source is needed — a m
 
 ### Phase 4D Complete
 
-Fleet scaling validated up to the simulator's throughput ceiling. The pipeline architecture (Kafka + Spark Structured Streaming) has demonstrated headroom beyond what the current Python simulator can exercise. Phase 4E (benchmarking and performance analysis) can begin.
+Fleet scaling validated up to the simulator's throughput ceiling. The pipeline architecture (Kafka + Spark Structured Streaming) has demonstrated headroom beyond what the current Python simulator can exercise. Phase 5 (load realism and benchmarking) can begin.
+
+---
+
+## 2026-06-14 — Phase 5A: Threaded Load Model Refactor
+
+### What Was Completed
+
+- `simulator/simulator.py` refactored to use 4 worker threads with round-robin fleet sharding
+- Single shared `KafkaProducer` across all threads (thread-safe, better batching)
+- `threading.Event` stop flag for clean shutdown on Ctrl+C — `stop.wait(timeout)` replaces `time.sleep()` so threads wake immediately on shutdown
+- Diagnostic event-rate counter added (`_record_event()`, `_rate_reporter()`) to measure Python's generation rate independently of Kafka throughput
+- Fleet sharding via `vehicles[i::num_threads]` — round-robin, perfectly even distribution, empty-shard guard for small fleets
+
+### Benchmark Results
+
+#### Python Generation Rate (standalone, no Spark running)
+
+| Fleet Size | Python ev/s | Sleep behaviour |
+|------------|-------------|-----------------|
+| 3,000 | 3,000 | Sleep filling gap — 1 event/truck/sec |
+| 10,000 | 10,000 | Sleep ≈ 0 — loop takes exactly 1 second |
+| 20,000 | ~10,500 | Sleep = 0 — Python running flat out |
+| 40,000 | ~10,400 | Sleep = 0 — ceiling confirmed |
+
+**Python ceiling: ~10,500 ev/s with 4 threads. 5x improvement over the sequential simulator (2,000 ev/s).**
+
+#### Full Pipeline (Python + Kafka + Spark running simultaneously)
+
+| Metric | Value |
+|--------|-------|
+| Python diagnostic ev/s | ~3,000 |
+| Spark input rate | ~3,000 |
+| Gap between Python and Spark | None |
+
+### Bottleneck Finding
+
+**The local Docker Kafka broker is the bottleneck under full pipeline load, not Python and not Spark.**
+
+When Spark is running, the Kafka broker handles two simultaneous workloads:
+- Produce path: Python → Kafka (~10,000 msg/sec attempted)
+- Consume path: Kafka → Spark (reading and tracking offsets)
+
+A single-node Docker broker on a MacBook Air cannot sustain both at full speed. It caps at ~3,000 msg/sec total throughput. When the broker slows down, the producer's internal buffer fills and `producer.send()` blocks — which is why the Python diagnostic also drops to ~3,000. Python is not slow; it is waiting on Kafka.
+
+The key evidence: without Spark running, Python generates 10,000 ev/s. With Spark running, both Python diagnostic and Spark input rate drop to the same ~3,000 ev/s ceiling simultaneously. No gap between producer and consumer — the shared constraint is the broker.
+
+**In a real production environment** (multi-broker Kafka cluster, more partitions, or a managed service), this ceiling would be orders of magnitude higher. The architecture is sound; the local single-node broker is the hardware constraint.
+
+### Phase 5A Complete
+
+Python is no longer the simulator bottleneck. The threading refactor pushed the standalone ceiling from 2,000 to ~10,500 ev/s. Under full pipeline load, the constraint is the local Kafka broker at ~3,000 msg/sec. Phase 5B (per-vehicle cadence and scheduling abstraction) can begin.
