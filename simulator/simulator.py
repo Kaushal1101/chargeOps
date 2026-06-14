@@ -1,4 +1,5 @@
 import argparse
+import heapq
 import random
 import threading
 import time
@@ -54,10 +55,12 @@ class Vehicle:
         vehicle_id: str,
         cargo_temp_threshold: float,
         sla_buffer_threshold: int,
+        interval_seconds: float = 1.0,
     ) -> None:
         self.vehicle_id = vehicle_id
         self.cargo_temp_threshold = cargo_temp_threshold
         self.sla_buffer_threshold = sla_buffer_threshold
+        self.interval_seconds = interval_seconds
         self._step: int = 0
 
     def current_scenario(self) -> Scenario:
@@ -88,6 +91,9 @@ class Vehicle:
     def advance(self) -> None:
         self._step += 1
 
+    def __lt__(self, other: "Vehicle") -> bool:
+        return self.vehicle_id < other.vehicle_id
+
 
 class Fleet:
     def __init__(self, vehicles: list[Vehicle]) -> None:
@@ -105,12 +111,21 @@ class Fleet:
 
     @classmethod
     def scaled(cls, n: int) -> "Fleet":
+        def _cadence() -> float:
+            r = random.random()
+            if r < 0.20:
+                return 0.5
+            if r < 0.80:
+                return 1.0
+            return 2.0
+
         return cls(
             [
                 Vehicle(
                     f"TRUCK_{i:04d}",
                     round(random.uniform(4.5, 6.0), 1),
                     random.randint(25, 40),
+                    interval_seconds=_cadence(),
                 )
                 for i in range(1, n + 1)
             ]
@@ -161,22 +176,29 @@ def _rate_reporter(stop: threading.Event, interval: float = 5.0) -> None:
 
 
 def worker(shard: list[Vehicle], producer: KafkaProducer, stop: threading.Event) -> None:
+    now = time.time()
+    heap = [(now + vehicle.interval_seconds * i / len(shard), vehicle) for i, vehicle in enumerate(shard)]
+    heapq.heapify(heap)
+
     while not stop.is_set():
-        start = time.time()
-        for vehicle in shard:
-            event = vehicle.generate_event()
-            _record_event()  # DIAGNOSTIC
-            producer.send(
-                TOPIC,
-                key=vehicle.vehicle_id.encode(),
-                value=event.to_json_bytes(),
-            )
-            print(
-                f"[{vehicle.vehicle_id}] {vehicle.current_scenario().state} | event_ts={event.event_ts}"
-            )
-            vehicle.advance()
-        elapsed = time.time() - start
-        stop.wait(max(0.0, 1.0 - elapsed))
+        next_time, vehicle = heapq.heappop(heap)
+        wait = next_time - time.time()
+        if wait > 0:
+            stop.wait(wait)
+        if stop.is_set():
+            break
+        event = vehicle.generate_event()
+        producer.send(
+            TOPIC,
+            key=vehicle.vehicle_id.encode(),
+            value=event.to_json_bytes(),
+        )
+        print(
+            f"[{vehicle.vehicle_id}] {vehicle.current_scenario().state} | interval={vehicle.interval_seconds}s | event_ts={event.event_ts}"
+        )
+        _record_event()  # DIAGNOSTIC
+        vehicle.advance()
+        heapq.heappush(heap, (time.time() + vehicle.interval_seconds * random.uniform(0.7, 1.3), vehicle))
 
 
 def run(fleet_size: int) -> None:

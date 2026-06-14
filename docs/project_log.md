@@ -556,3 +556,42 @@ Spark's 2,700 ev/s ceiling is determined by how long each micro-batch takes: JSO
 ### Phase 5B Complete
 
 Kafka is no longer the ceiling. Python generates 11,000 ev/s, Kafka buffers successfully, and Spark consumes at its own processing pace (~2,700 ev/s). The pipeline is now correctly structured with Kafka acting as the decoupling buffer between a fast producer and a throughput-bound stream processor.
+
+---
+
+## 2026-06-14 — Phase 5C: Per-Vehicle Cadence and Scheduling
+
+### What Was Completed
+
+- `Vehicle` class extended with `interval_seconds: float = 1.0` field
+- `Vehicle.__lt__()` added to support heap comparison tiebreaking when two vehicles share the same next-emit timestamp
+- `Fleet.scaled()` assigns cadence profiles via a `_cadence()` helper on construction
+- `worker()` replaced the uniform shard loop with a per-shard min-heap (`heapq`) scheduler
+- ±30% proportional jitter added to each emission interval via `random.uniform(0.7, 1.3)`
+- `import heapq` added
+
+### Cadence Profiles
+
+| Profile | Base Interval | Jitter Range | Fleet Share |
+|---------|--------------|--------------|-------------|
+| Fast | 0.5s | 0.35–0.65s | 20% |
+| Normal | 1.0s | 0.7–1.3s | 60% |
+| Slow | 2.0s | 1.4–2.6s | 20% |
+
+### Key Design Decisions
+
+**Per-shard heap, not a single global scheduler**
+A single scheduler thread at 10,000+ trucks would reintroduce the Phase 4D sequential bottleneck. Each of the 4 worker threads maintains its own `heapq` over its vehicle shard — no cross-thread coordination needed, throughput from Phase 5A is preserved.
+
+**Staggered heap initialisation**
+Initial emit times are offset by `interval_seconds * i / len(shard)` so all vehicles in a shard don't fire simultaneously at startup. Without this, the first second produces a burst equal to the full shard size.
+
+**Proportional jitter over fixed ranges**
+`±` jitter as a multiplier (`random.uniform(0.7, 1.3)`) preserves the semantic meaning of fast/normal/slow profiles. A flat random range (e.g. 0–5s for all slow trucks) would collapse the profiles into noise and make cadence diversity unobservable.
+
+**`__lt__` on Vehicle for heap safety**
+`heapq` compares tuple elements in order. If two vehicles share the same float timestamp (unlikely but possible), Python falls through to comparing the `Vehicle` objects. Without `__lt__`, this raises `TypeError`. Resolved by comparing `vehicle_id` strings as a stable tiebreaker.
+
+### Phase 5C Complete
+
+The simulator now produces a non-uniform, jittered traffic pattern with distinct fast, normal, and slow vehicles. The output is visibly heterogeneous and more representative of a real fleet than a perfectly regular loop. Phase 5D (benchmark harness and Spark limit testing) can begin.
