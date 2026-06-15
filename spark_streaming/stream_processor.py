@@ -42,6 +42,7 @@ def run():
         SparkSession.builder.appName("LogiShield-StreamProcessor")
         .master("local[*]")
         .config("spark.ui.port", "4040")
+        .config("spark.sql.shuffle.partitions", "8")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")

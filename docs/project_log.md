@@ -595,3 +595,34 @@ Initial emit times are offset by `interval_seconds * i / len(shard)` so all vehi
 ### Phase 5C Complete
 
 The simulator now produces a non-uniform, jittered traffic pattern with distinct fast, normal, and slow vehicles. The output is visibly heterogeneous and more representative of a real fleet than a perfectly regular loop. Phase 5D (benchmark harness and Spark limit testing) can begin.
+
+---
+
+## 2026-06-15 — Spark Shuffle Partitions Fix and Simulator Rate Characterisation
+
+### Spark Configuration Fix
+
+Added `spark.sql.shuffle.partitions=8` to `stream_processor.py`.
+
+Spark's default is 200 shuffle partitions. In `local[*]` mode on an 8-core MacBook Air, this creates 200 parallel tasks during every shuffle operation when only 8 cores are available — 192 tasks are immediately queued and idle. This was a significant source of overhead on every micro-batch.
+
+Setting it to 8 (matching available cores) removed this overhead. After the fix, Spark input rate matched the Python simulator output rate, confirming that the previous ~2,700 ev/s ceiling was a **Spark configuration problem, not a hardware bottleneck**.
+
+**Conclusion: the laptop is not the bottleneck. Spark was misconfigured.**
+
+Migration to remote VMs is not necessary at this stage.
+
+### Simulator Rate Characterisation
+
+With the Phase 5C per-vehicle cadence scheduler, the simulator no longer emits at `fleet_size × 1 ev/s`. The min-heap scheduler fires each vehicle only when it is due, so the actual output rate is determined by the cadence profile distribution:
+
+| Profile | Interval | Fleet share | Contribution |
+|---------|----------|-------------|--------------|
+| Fast | 0.5s | 20% | 0.40 ev/truck/s |
+| Normal | 1.0s | 60% | 0.60 ev/truck/s |
+| Slow | 2.0s | 20% | 0.10 ev/truck/s |
+| **Average** | | | **~1.1 ev/truck/s theoretical** |
+
+In practice, the observed rate for a 10,000-truck fleet is consistently **~7,000 ev/s** rather than the theoretical ~11,000 ev/s. The gap is attributable to heap operation overhead (heappush/heappop per emission), `stop.wait()` scheduling granularity, and jitter reducing fast truck throughput.
+
+The simulator ceiling remains **~11,000 ev/s regardless of fleet size** — adding more trucks beyond the point where the heap saturates the 4 worker threads does not increase throughput further. This ceiling is now Spark's effective input ceiling under the current configuration.
