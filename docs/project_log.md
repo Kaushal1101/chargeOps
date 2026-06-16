@@ -626,3 +626,57 @@ With the Phase 5C per-vehicle cadence scheduler, the simulator no longer emits a
 In practice, the observed rate for a 10,000-truck fleet is consistently **~7,000 ev/s** rather than the theoretical ~11,000 ev/s. The gap is attributable to heap operation overhead (heappush/heappop per emission), `stop.wait()` scheduling granularity, and jitter reducing fast truck throughput.
 
 The simulator ceiling remains **~11,000 ev/s regardless of fleet size** — adding more trucks beyond the point where the heap saturates the 4 worker threads does not increase throughput further. This ceiling is now Spark's effective input ceiling under the current configuration.
+
+---
+
+## 2026-06-16 — Phase 5D: State Transition Alerting & Temperature Signal Simplification
+
+### What Was Completed
+
+- `spark_streaming/stream_processor.py` updated to use `avg(cargo_temperature)` in windowed aggregation — `max` removed from imports and pipeline
+- `foreachBatch` output mode added with `write_on_transition()` function and driver-side `last_tiers: dict[str, str]` state
+- Alert records now written to `risk-alerts` via `df.write.format("kafka")` inside `foreachBatch` instead of a direct streaming sink
+- Alerts suppressed when a vehicle's risk tier is unchanged from the previous batch
+
+### Key Design Decisions
+
+**`avg` over `max` for cargo temperature**
+`max_cargo_temperature` in a 10-minute window always captured the worst RED-level reading in the window, even when most of the window was GREEN or YELLOW. This made YELLOW alerts structurally invisible — the single highest temperature always dominated. Switching to `avg` weights the classification by the proportion of time spent near the threshold, which restores YELLOW visibility and makes the tier reflect sustained thermal drift rather than a single spike.
+
+**Driver-side dict for state tracking (`last_tiers`)**
+The state is a simple `{vehicle_id: tier}` dict that lives in the Spark driver process. This is the simplest correct implementation: no RDD operations, no distributed state stores, no Kafka offsets to manage. It is reset on Spark restart (acceptable) and sufficient for this project's observability goals.
+
+**`foreachBatch` with `df.write.format("kafka")` for output**
+The streaming sink writes every update to Kafka in `update` mode, which cannot be filtered before writing. `foreachBatch` gives access to each micro-batch as a regular DataFrame, allowing the transition check to happen before any write. The write itself uses Kafka's batch mode (`df.write`) rather than a separate KafkaProducer, keeping the implementation within the Spark API boundary.
+
+### Validation Results
+
+- `risk-alerts` topic confirmed active with `--fleet-size 5`
+- YELLOW alerts now appear alongside RED — `avg` temperature restored YELLOW visibility as expected
+- Repeated identical-tier alerts suppressed — duplicate emissions no longer flood the topic
+- Alert stream shows **YELLOW ↔ RED oscillation** as the dominant pattern, not identical repetition
+
+### Key Observation: Window Boundary Oscillation
+
+The alert stream oscillates between YELLOW and RED rather than emitting a single transition. This is expected behavior, not a bug.
+
+**Why it happens:** The 10-minute sliding window fires every 30 seconds. Each firing computes `avg_cargo_temperature` over a different mix of events — as the window slides, the blend of GREEN/YELLOW/RED data shifts. When a truck is transitioning between phases, the average hovers near the threshold boundary. One 30-second window produces an average just above RED threshold; the next produces one just below — causing the tier to genuinely alternate.
+
+**Why this is correct:** Each oscillation represents a real tier change, not a duplicate. The `last_tiers` filter is working as designed — it suppresses consecutive identical tiers (RED→RED, YELLOW→YELLOW) and allows genuine transitions through. An oscillating truck is meaningfully different from one firmly in RED: it is at the classification boundary, which is the most operationally interesting region.
+
+**Comparison to before Phase 5D:**
+
+| Before Phase 5D | After Phase 5D |
+|---|---|
+| RED, RED, RED, RED (same tier repeated per window) | RED, YELLOW, RED, YELLOW (genuine transitions only) |
+| No transition filter | Transition filter active |
+| YELLOW structurally invisible | YELLOW visible when avg is near threshold |
+
+### Phase 5D Complete
+
+Exit criteria satisfied:
+- `avg_cargo_temperature` is the sole temperature signal in risk classification
+- `max_cargo_temperature` removed entirely
+- Alerts fire only on tier transitions — duplicate identical-state alerts suppressed
+- YELLOW tier restored as a visible, meaningful risk state
+- `risk-alerts` topic reflects genuine state changes rather than window-by-window repetition

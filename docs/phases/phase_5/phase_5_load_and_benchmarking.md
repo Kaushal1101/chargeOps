@@ -145,38 +145,29 @@ Deliverables
 
 ⸻
 
-Phase 5D — Benchmark Harness & Spark Limits
+Phase 5D — State Transition Alerting & Temperature Signal Simplification
 
 Goal
 
-Use the improved simulator to measure Spark’s real throughput limits under multiple load profiles.
+Improve the quality of risk-alerts by removing noisy duplicate emissions and simplifying the temperature signal used for risk classification.
 
-Metrics To Collect
+Design Decisions
 
-* Fleet size
-* Per-truck emission rate
-* Events per second
-* Spark input rate
-* Spark processing rate
-* Batch duration
-* State memory growth
-* Watermark behavior
-* Error rate under malformed input
+* Replace `max(cargo_temperature)` with `avg(cargo_temperature)` in the windowed aggregation — focuses classification on sustained thermal drift rather than one-off spikes, restores YELLOW visibility
+* Emit alerts only on state transitions using `foreachBatch` with a driver-side Python dict (`last_tiers: dict[vehicle_id, str]`) — simple, explainable, sufficient for this project
+* Within `foreachBatch`, write to Kafka using `df.write.format("kafka")` in batch mode rather than creating a separate producer
 
 Questions
 
-* At what point does the load generator stop being the bottleneck?
-* At what point does Spark begin to fall behind?
-* Which load profile is most stressful?
-* How does the system behave under combined stress conditions?
+* Does avg temperature restore YELLOW alert visibility?
+* Does transition-based emission materially reduce duplicate alerts?
+* Does the alert stream become more meaningful and easier to interpret?
 
 Deliverables
 
-* Benchmark report
-* Load profile comparison
-* Throughput and latency summary
-* Bottleneck analysis
-* Resume-ready metrics
+* Updated risk tiering logic using avg temperature
+* `foreachBatch` output with driver-side state transition tracking
+* Cleaner, lower-volume `risk-alerts` topic
 
 ⸻
 
@@ -192,7 +183,7 @@ Phase 5 is complete when:
 
 ⸻
 
-Phase 5 Outcome
+Phase 5 Outcome. 
 
 At the conclusion of Phase 5, LogiShield will have a realistic load-generation and benchmarking pipeline that can stress Spark under varied conditions rather than only a perfectly regular stream.
 

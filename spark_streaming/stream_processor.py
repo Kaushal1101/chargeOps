@@ -8,7 +8,6 @@ from pyspark.sql.functions import (
     first,
     from_json,
     lit,
-    max as spark_max,
     struct,
     to_json,
     udf,
@@ -94,7 +93,7 @@ def run():
         )
         .agg(
             avg(col("delivery_buffer")).alias("avg_delivery_buffer"),
-            spark_max(col("cargo_temperature")).alias("max_cargo_temperature"),
+            avg(col("cargo_temperature")).alias("avg_cargo_temperature"),
             first(col("sla_buffer_threshold")).alias("sla_buffer_threshold"),
             first(col("cargo_temp_threshold")).alias("cargo_temp_threshold"),
         )
@@ -104,12 +103,12 @@ def run():
         "risk_tier",
         when(
             (col("avg_delivery_buffer") < 0)
-            | (col("max_cargo_temperature") > col("cargo_temp_threshold")),
+            | (col("avg_cargo_temperature") > col("cargo_temp_threshold")),
             "RED",
         )
         .when(
             (col("avg_delivery_buffer") < col("sla_buffer_threshold"))
-            | (col("max_cargo_temperature") > col("cargo_temp_threshold") * 0.9),
+            | (col("avg_cargo_temperature") > col("cargo_temp_threshold") * 0.9),
             "YELLOW",
         )
         .otherwise("GREEN"),
@@ -125,7 +124,7 @@ def run():
         col("vehicle_id"),
         col("risk_tier"),
         col("avg_delivery_buffer").cast(IntegerType()).alias("delivery_buffer"),
-        col("max_cargo_temperature").alias("cargo_temperature"),
+        col("avg_cargo_temperature").alias("cargo_temperature"),
         when(
             col("risk_tier") == "RED",
             when(
@@ -138,7 +137,7 @@ def run():
             ).otherwise(
                 concat(
                     lit("Cargo temperature exceeded threshold: "),
-                    col("max_cargo_temperature").cast("string"),
+                    col("avg_cargo_temperature").cast("string"),
                     lit("C"),
                 )
             ),
@@ -154,7 +153,7 @@ def run():
             ).otherwise(
                 concat(
                     lit("Cargo temperature approaching threshold: "),
-                    col("max_cargo_temperature").cast("string"),
+                    col("avg_cargo_temperature").cast("string"),
                     lit("C"),
                 )
             )
@@ -162,15 +161,40 @@ def run():
         .alias("reason"),
     )
 
-    kafka_payload = alert_records.select(
-        col("vehicle_id").cast(StringType()).alias("key"),
-        to_json(struct(*[col(c) for c in alert_records.columns])).alias("value"),
-    )
+    last_tiers: dict[str, str] = {}
+
+    def write_on_transition(batch_df, batch_id):
+        if batch_df.rdd.isEmpty():
+            return
+
+        rows = batch_df.collect()
+        new_alerts = []
+        for row in rows:
+            vid = row["vehicle_id"]
+            tier = row["risk_tier"]
+            if last_tiers.get(vid) != tier:
+                last_tiers[vid] = tier
+                new_alerts.append(row)
+
+        if not new_alerts:
+            return
+
+        spark_session = SparkSession.getActiveSession()
+        new_df = spark_session.createDataFrame(new_alerts, batch_df.schema)
+
+        kafka_output = new_df.select(
+            col("vehicle_id").cast(StringType()).alias("key"),
+            to_json(struct(*[col(c) for c in new_df.columns])).alias("value"),
+        )
+
+        kafka_output.write.format("kafka") \
+            .option("kafka.bootstrap.servers", "localhost:9093") \
+            .option("topic", "risk-alerts") \
+            .save()
 
     query = (
-        kafka_payload.writeStream.format("kafka")
-        .option("kafka.bootstrap.servers", "localhost:9093")
-        .option("topic", "risk-alerts")
+        alert_records.writeStream
+        .foreachBatch(write_on_transition)
         .option("checkpointLocation", "/tmp/logishield-checkpoints/risk-alerts")
         .outputMode("update")
         .trigger(processingTime="5 seconds")
