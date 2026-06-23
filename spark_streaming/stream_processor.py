@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
@@ -42,6 +43,7 @@ def run():
         .master("local[*]")
         .config("spark.ui.port", "4040")
         .config("spark.sql.shuffle.partitions", "8")
+        .config("spark.sql.session.timeZone", "UTC")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
@@ -50,7 +52,7 @@ def run():
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", "localhost:9093")
         .option("subscribe", "fleet-telemetry")
-        .option("startingOffsets", "earliest")
+        .option("startingOffsets", "latest")
         .load()
     )
 
@@ -120,11 +122,12 @@ def run():
 
     alert_records = alerts.select(
         gen_id().alias("event_id"),
-        col("window.end").cast("string").alias("event_ts"),
+        col("window.start").cast("string").alias("window_start"),
+        col("window.end").cast("string").alias("window_end"),
         col("vehicle_id"),
         col("risk_tier"),
         col("avg_delivery_buffer").cast(IntegerType()).alias("delivery_buffer"),
-        col("avg_cargo_temperature").alias("cargo_temperature"),
+        col("avg_cargo_temperature").alias("avg_temperature"),
         when(
             col("risk_tier") == "RED",
             when(
@@ -182,6 +185,9 @@ def run():
         spark_session = SparkSession.getActiveSession()
         new_df = spark_session.createDataFrame(new_alerts, batch_df.schema)
 
+        alert_ts_str = datetime.now(timezone.utc).isoformat()
+        new_df = new_df.withColumn("alert_ts", lit(alert_ts_str))
+
         kafka_output = new_df.select(
             col("vehicle_id").cast(StringType()).alias("key"),
             to_json(struct(*[col(c) for c in new_df.columns])).alias("value"),
@@ -196,7 +202,7 @@ def run():
         alert_records.writeStream
         .foreachBatch(write_on_transition)
         .option("checkpointLocation", "/tmp/logishield-checkpoints/risk-alerts")
-        .outputMode("update")
+        .outputMode("append")
         .trigger(processingTime="5 seconds")
         .start()
     )
