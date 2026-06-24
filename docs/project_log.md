@@ -680,3 +680,177 @@ Exit criteria satisfied:
 - Alerts fire only on tier transitions — duplicate identical-state alerts suppressed
 - YELLOW tier restored as a visible, meaningful risk state
 - `risk-alerts` topic reflects genuine state changes rather than window-by-window repetition
+
+---
+
+## 2026-06-24 — Phase 6A: Benchmark Harness
+
+### What Was Completed
+
+- `benchmarks/__init__.py` — package marker enabling `python -m benchmarks.bench` entry point
+- `benchmarks/bench.py` — benchmark runner that observes a live pipeline by consuming the `risk-alerts` Kafka topic, measuring processing lag (`alert_ts - window_end`) and alert throughput, querying the Spark REST API for job durations, and writing results to a structured JSON file
+- `requirements.txt` updated: `requests==2.32.3` added for Spark REST calls
+- `.gitignore` updated: `benchmarks/results/` excluded so raw result files are not committed
+- Three pipeline bugs discovered and fixed during harness testing
+
+### Pipeline Bugs Fixed During Phase 6A
+
+**Bug 1: timezone mismatch (lag always null)**
+
+`window_end` was emitted in local time (UTC+8, e.g. `"2026-06-24 18:06:00"`) while `alert_ts` was in UTC (`"2026-06-24T10:06:00+00:00"`). The computed lag was always −8 hours, always filtered as negative, lag_samples always 0.
+
+Root cause: Spark uses the JVM system timezone when casting `window.start`/`window.end` to string unless the session timezone is explicitly set.
+
+Fix: `.config("spark.sql.session.timeZone", "UTC")` added to SparkSession in `stream_processor.py`. `window_end` now emits in UTC and the two timestamps are comparable.
+
+**Bug 2: backlog replay contaminating lag measurement**
+
+With `startingOffsets: earliest`, the benchmark consumer replayed every alert ever written to `risk-alerts`. Alerts from days earlier had lag values equal to their age (e.g. 7.6 days), making the lag metric meaningless.
+
+Fix: changed to `startingOffsets: latest` so the pipeline only processes new events from the moment Spark starts. Past backlog is ignored.
+
+**Bug 3: negative lag (wrong output mode)**
+
+With `outputMode("update")`, Spark emits alerts for windows that are still open. At emission time, `alert_ts` (wall clock when Spark writes) is earlier than `window_end` (the future time when the window will close). This produces systematically negative lag — structurally impossible to measure correctly.
+
+Fix: changed to `outputMode("append")`. In append mode, Spark holds a window result until the watermark has advanced past `window_end`, guaranteeing the window is fully closed before emitting. `alert_ts` is always after `window_end`, producing positive lag values representing actual processing latency.
+
+**Lag formula:** `lag = alert_ts − window_end`
+
+With `append` mode, 5-minute window, 5-minute watermark, and 5-second trigger, expected lag was 60–90 seconds. Observed lag was ~35–38 seconds with the initial configuration, confirming the formula was working.
+
+### Spark REST API Finding
+
+The harness initially attempted to query Spark's streaming metrics via REST (`/streaming/statistics`, `/streaming/batches`). Both returned 404. These are legacy DStream endpoints. Spark Structured Streaming does not expose streaming-specific metrics via the REST API in Spark 3.5.1 local mode. The `spark_jobs` section in the initial harness used job-level duration data instead, which was a proxy rather than a true streaming metric. This limitation was noted and addressed in Phase 6B.
+
+### Key Decisions Made
+
+**Observer-only harness**
+The benchmark runner is entirely passive. It does not start or stop the simulator, Spark, or Kafka. It connects to an already-running pipeline, observes for a fixed duration, and writes results. This keeps the harness simple, composable, and free of process management complexity.
+
+**Kafka consumer for alert measurement**
+Rather than polling an internal Spark metrics endpoint, the harness consumes `risk-alerts` directly. This measures what the pipeline actually delivers to downstream consumers, not an internal Spark accounting figure.
+
+**JSON output with structured schema**
+Results are written as a single JSON object per run. This allows programmatic comparison across fleet sizes without manual transcription and makes the output diff-able in git if the gitignore is relaxed in the future.
+
+### Phase 6A Complete
+
+Benchmark harness functional. Pipeline timezone, offset, and output mode bugs resolved. Lag measurement producing correct positive values (~35s). Results written to structured JSON.
+
+---
+
+## 2026-06-24 — Phase 6B: Throughput Benchmarking
+
+### What Was Completed
+
+**Harness upgrade**
+
+- `stream_processor.py`: watermark reduced `"5 minutes"` → `"1 minute"`, window reduced `"10 minutes"` → `"5 minutes"`, `_ProgressWriter(StreamingQueryListener)` added to write per-batch streaming metrics to `/tmp/logishield-spark-progress.jsonl`
+- `bench.py`: dual-topic consumer (`fleet-telemetry` + `risk-alerts`), JSONL progress file tailing replacing Spark REST calls, `telemetry_ingress` section added, debug prints and skip counters removed, JSONL historical bleed fix applied
+
+**Benchmark runs at four fleet sizes**
+
+Each run: 300 seconds observation, Spark running continuously across fleet-size changes, simulator restarted between sizes.
+
+### Benchmark Results
+
+| Metric | 100 vehicles | 1,000 vehicles | 5,000 vehicles | 10,000 vehicles |
+|---|---|---|---|---|
+| ev/s (ingress) | 105.50 | 1,114.17 | 3,921.94 | 6,544.05 |
+| spark input rps | 104.71 | 1,115.40 | 3,930.10 | 6,672.51 |
+| spark process rps | 514.93 | 6,968.78 | 12,780.81 | 20,053.51 |
+| trigger avg ms | 1,147 | 927 | 1,969 | 1,851 |
+| trigger p95 ms | 1,848 | 1,472 | 3,370 | 3,245 |
+| batch samples | 143* | 60 | 60 | 59 |
+| alerts total | 0 | 0 | 399 | 2 |
+| lag avg (s) | n/a | n/a | 68.69 | 69.50 |
+
+*100-vehicle batch_samples=143 is inflated. This run predated the JSONL historical-bleed fix (see below). Spark metrics for that run are averaged over ~12 minutes of session history rather than the 300-second window. The ev/s and spark_input_rps values are still accurate.
+
+### Harness Issues Found and Fixed During Phase 6B
+
+**Issue 1: FLEET_TELEMETRY_TOPIC not subscribed (Cursor truncation)**
+
+Cursor's implementation of the dual-topic consumer defined `FLEET_TELEMETRY_TOPIC` as a constant but did not add it to the `KafkaConsumer` subscription — the consumer only subscribed to `RISK_ALERTS_TOPIC`. As a result, `telemetry_ingress` would always show 0 events.
+
+Fix: added `FLEET_TELEMETRY_TOPIC` to the `KafkaConsumer(...)` constructor alongside `RISK_ALERTS_TOPIC`.
+
+**Issue 2: JSONL historical bleed (Spark metrics contaminated by pre-benchmark history)**
+
+`_ProgressWriter` appends one JSON line per Spark batch to `/tmp/logishield-spark-progress.jsonl`. The file is cleared only when Spark restarts (in `onQueryStarted`). When Spark keeps running between fleet-size changes, the file accumulates all batches from session start. `bench.py` initialized `last_progress_line = 0`, so each benchmark run read all historical lines, averaging Spark metrics across the entire session rather than just the 300-second observation window.
+
+Evidence: 100-vehicle run showed `batch_samples: 143` (expected ~60 for 300s ÷ 5s trigger = 60 batches). 143 batches × 5s ≈ 715 seconds of Spark history was being averaged.
+
+Fix: `last_progress_line` now initialises to the current line count of the JSONL file at benchmark start, skipping all pre-existing history. The 1,000/5,000/10,000-vehicle runs all show `batch_samples: 59–60`, confirming the fix.
+
+**Issue 3: Debug prints left in bench.py (Cursor truncation)**
+
+`_debug_printed`, `_missing_fields`, `_parse_failures`, `_negative_lags` state variables and their associated `[debug]` stderr prints were not removed by Cursor due to prompt truncation. These were removed manually.
+
+### Key Decisions Made
+
+**JSONL append over single-file overwrite for streaming metrics**
+
+`_ProgressWriter.onQueryProgress` appends one JSON line per batch rather than overwriting a single JSON file. This eliminates the race condition where `bench.py` reads the file mid-write and gets a partial or corrupted JSON object. Each line is a complete self-contained record, and the reader skips lines already processed using `last_progress_line`.
+
+**`triggerExecution` key from `durationMs` dict**
+
+Spark's `durationMs` is a dict with multiple keys (e.g. `addBatch`, `getBatch`, `triggerExecution`). `triggerExecution` represents total wall-clock time for the batch from trigger to completion — the correct value to compare against the 5-second trigger interval to assess whether Spark is keeping up.
+
+**5-minute window / 1-minute watermark for Phase 6B**
+
+Reduced from 10-minute window / 5-minute watermark used in Phases 3–5. The shorter window reduces cold start from 15 minutes to 6 minutes and makes lag values more meaningful at 60–90s rather than 360–600s. The watermark/window ratio (1:5) is preserved so the relative semantics are unchanged.
+
+**Cold start only required once per session**
+
+When Spark keeps running between fleet-size changes, only the simulator is restarted. Existing Spark state and window aggregations carry over. Fleet-size changes after the first only require 2–3 minutes (watermark advance + one window slide) rather than the full 6-minute cold start.
+
+### Findings
+
+**Finding 1: Kafka is not the bottleneck at any scale tested**
+
+`spark_input_rps` tracks `events_per_second` exactly at every fleet size — no backpressure, no lag behind the broker. Kafka is consuming from the simulator and Spark is consuming from Kafka at the same rate, with no gap.
+
+**Finding 2: Spark is not the bottleneck at any scale tested**
+
+Trigger duration never exceeded 67% of the 5-second trigger budget (p95 = 3,370ms at 5,000 vehicles; p95 = 3,245ms at 10,000 vehicles). Spark has headroom remaining at the maximum fleet size tested.
+
+`spark_process_rps` running higher than `spark_input_rps` is expected: each input row falls into multiple overlapping windows (5-min window / 30-sec slide = up to 10 windows per event), so Spark produces more output rows from aggregations than it receives as input.
+
+**Finding 3: The Python simulator is the throughput ceiling**
+
+Per-vehicle event rate drops sharply as fleet size scales beyond what the heap scheduler can sustain:
+
+| Fleet size | ev/s | ev/s per vehicle |
+|---|---|---|
+| 100 | 105.50 | 1.055 |
+| 1,000 | 1,114.17 | 1.114 |
+| 5,000 | 3,921.94 | 0.784 |
+| 10,000 | 6,544.05 | 0.654 |
+
+Expected linear throughput at 5,000 vehicles would be ~5,500 ev/s. Observed is 3,922 ev/s — a 29% shortfall. The per-vehicle rate falls because the 4-thread heap scheduler accumulates overhead as each shard grows: more heappush/heappop operations per second, scheduling granularity limits from `stop.wait()`, and jitter effects. This is consistent with the ceiling characterised in Phase 5A/5B (~10,500 ev/s Python ceiling, ~7,000 ev/s in practice).
+
+**Finding 4: Alert metrics are transition-driven, not throughput-driven**
+
+Alerts are only emitted by `write_on_transition` when a vehicle's tier changes. With 5-minute windows averaging across ~20 simulator scenario cycles (15-second GREEN/YELLOW/RED loop), each vehicle settles into a stable average tier shortly after startup. Tier transitions happen once per vehicle at warm-up; thereafter the tier is stable and no further alerts are emitted.
+
+The benchmark consumer uses `auto_offset_reset="latest"` and misses the warm-up transition burst. This explains:
+- 100 and 1,000 vehicles: 0 alerts (all transitions during 6-minute cold start, before consumer joined)
+- 5,000 vehicles: 399 alerts with 68.69s lag (some transitions fell within the benchmark window)
+- 10,000 vehicles: 2 alerts (transitions mostly occurred before the benchmark consumer joined; lag of ~69.5s confirms the pipeline was working correctly for the 2 that arrived)
+
+Alert throughput is not a meaningful pipeline throughput metric under this design. Telemetry ingress rate and Spark input rate are the correct measurements for bottleneck analysis.
+
+**Finding 5: Processing lag is stable at 68–70 seconds**
+
+At 5,000 vehicles (the only fleet size with a meaningful lag sample), lag avg = 68.69s, p50 = 68.96s, p95 = 70.93s. The tight distribution confirms the lag is deterministic: 5-minute window + 1-minute watermark + 5-second trigger = ~66 seconds minimum, with ~2–5 seconds of Spark write overhead on top. This is the expected value and indicates the pipeline is processing in real time with no accumulating backlog.
+
+### Phase 6B Complete
+
+Exit criteria satisfied:
+- Throughput data collected at 100, 1,000, 5,000, and 10,000 vehicles
+- Current throughput ceiling documented: Python simulator is the limiting component at ~6,500 ev/s for 10,000 vehicles
+- Kafka and Spark both have headroom at all tested fleet sizes
+- Results saved to `benchmarks/results/` in structured JSON for future Redis comparison
+- Bottleneck identified: Python simulator heap scheduler, not Kafka or Spark

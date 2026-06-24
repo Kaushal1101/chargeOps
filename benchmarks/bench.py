@@ -12,44 +12,17 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import requests
 from kafka import KafkaConsumer
 
-SPARK_REST_BASE = "http://localhost:4040/api/v1"
+SPARK_PROGRESS_FILE = "/tmp/logishield-spark-progress.jsonl"
 KAFKA_BOOTSTRAP = "localhost:9093"
+FLEET_TELEMETRY_TOPIC = "fleet-telemetry"
 RISK_ALERTS_TOPIC = "risk-alerts"
 CONSUMER_POLL_TIMEOUT_MS = 1000
-REQUEST_TIMEOUT_SECONDS = 5
-SPARK_POLL_INTERVAL_SECONDS = 30
-
-
-def _get_application_id() -> str | None:
-    try:
-        resp = requests.get(f"{SPARK_REST_BASE}/applications", timeout=REQUEST_TIMEOUT_SECONDS)
-        resp.raise_for_status()
-        apps = resp.json()
-    except (requests.RequestException, ValueError):
-        return None
-    return apps[0].get("id") if apps else None
-
-
-def _get_spark_jobs(app_id: str) -> list[dict]:
-    try:
-        resp = requests.get(
-            f"{SPARK_REST_BASE}/applications/{app_id}/jobs",
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except (requests.RequestException, ValueError) as exc:
-        print(f"[bench] failed to fetch Spark jobs: {exc}", file=sys.stderr)
-        return []
-    return data if isinstance(data, list) else []
 
 
 def _parse_ts(ts_str: str | None) -> datetime | None:
@@ -100,17 +73,17 @@ def run_benchmark(duration: int, fleet_size: int, output_path: Path) -> dict:
     lags_seconds: list[float] = []
     tier_counts: dict[str, int] = {}
     alert_wall_times: list[float] = []
-    _missing_fields = 0
-    _parse_failures = 0
-    _negative_lags = 0
-    _debug_printed = 0
+    telemetry_event_count = 0
 
-    jobs_seen: set[int] = set()
-    job_durations_ms: list[float] = []
-    last_spark_poll = 0.0
+    input_rates: list[float] = []
+    processing_rates: list[float] = []
+    trigger_durations_ms: list[float] = []
+    _progress_path = Path(SPARK_PROGRESS_FILE)
+    last_progress_line = len(_progress_path.read_text(encoding="utf-8").splitlines()) if _progress_path.exists() else 0
 
     consumer = KafkaConsumer(
         RISK_ALERTS_TOPIC,
+        FLEET_TELEMETRY_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP,
         auto_offset_reset="latest",
         enable_auto_commit=False,
@@ -128,6 +101,10 @@ def run_benchmark(duration: int, fleet_size: int, output_path: Path) -> dict:
             if time.monotonic() >= deadline:
                 break
 
+            if msg.topic == FLEET_TELEMETRY_TOPIC:
+                telemetry_event_count += 1
+                continue
+
             alert = msg.value
             alert_wall_times.append(time.time())
 
@@ -135,42 +112,29 @@ def run_benchmark(duration: int, fleet_size: int, output_path: Path) -> dict:
             if tier:
                 tier_counts[tier] = tier_counts.get(tier, 0) + 1
 
-            raw_we = alert.get("window_end")
-            raw_at = alert.get("alert_ts")
-            window_end = _parse_ts(raw_we)
-            alert_ts = _parse_ts(raw_at)
+            window_end = _parse_ts(alert.get("window_end"))
+            alert_ts = _parse_ts(alert.get("alert_ts"))
 
-            if _debug_printed < 3:
-                _debug_printed += 1
-                print(f"[debug] window_end={raw_we!r} → {window_end}", file=sys.stderr)
-                print(f"[debug] alert_ts  ={raw_at!r} → {alert_ts}", file=sys.stderr)
-
-            if raw_we is None or raw_at is None:
-                _missing_fields += 1
-            elif window_end is None or alert_ts is None:
-                _parse_failures += 1
-            else:
+            if window_end is not None and alert_ts is not None:
                 lag = (alert_ts - window_end).total_seconds()
                 if lag >= 0:
                     lags_seconds.append(lag)
-                else:
-                    _negative_lags += 1
-                    if _debug_printed <= 3:
-                        print(f"[debug] lag={lag:.1f}s (negative, discarded)", file=sys.stderr)
 
-        now = time.monotonic()
-        if now - last_spark_poll >= SPARK_POLL_INTERVAL_SECONDS:
-            last_spark_poll = now
-            app_id = _get_application_id()
-            if app_id:
-                for job in _get_spark_jobs(app_id):
-                    jid = job.get("jobId")
-                    if jid is None or jid in jobs_seen:
-                        continue
-                    jobs_seen.add(jid)
-                    dur = job.get("duration")
-                    if isinstance(dur, (int, float)):
-                        job_durations_ms.append(float(dur))
+        if _progress_path.exists():
+            lines = [ln for ln in _progress_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            for line in lines[last_progress_line:]:
+                rec = json.loads(line)
+                ir = rec.get("inputRowsPerSecond")
+                pr = rec.get("processedRowsPerSecond")
+                if isinstance(ir, (int, float)):
+                    input_rates.append(float(ir))
+                if isinstance(pr, (int, float)):
+                    processing_rates.append(float(pr))
+                dur = rec.get("durationMs") or {}
+                te = dur.get("triggerExecution")
+                if isinstance(te, (int, float)):
+                    trigger_durations_ms.append(float(te))
+            last_progress_line = len(lines)
 
     consumer.close()
 
@@ -181,6 +145,10 @@ def run_benchmark(duration: int, fleet_size: int, output_path: Path) -> dict:
         "run_ts": run_started_at,
         "fleet_size": fleet_size,
         "duration_seconds": duration,
+        "telemetry_ingress": {
+            "total_events": telemetry_event_count,
+            "events_per_second": round(telemetry_event_count / duration, 3) if duration > 0 else 0.0,
+        },
         "alerts": {
             "total": total_alerts,
             "per_second": round(alerts_per_sec, 3),
@@ -192,15 +160,13 @@ def run_benchmark(duration: int, fleet_size: int, output_path: Path) -> dict:
             "p95": _percentile(lags_seconds, 95),
             "p99": _percentile(lags_seconds, 99),
             "samples": len(lags_seconds),
-            "skipped_missing_fields": _missing_fields,
-            "skipped_parse_failures": _parse_failures,
-            "skipped_negative_lag": _negative_lags,
         },
-        "spark_jobs": {
-            "avg_duration_ms": _safe_mean(job_durations_ms),
-            "p95_duration_ms": _percentile(job_durations_ms, 95),
-            "p99_duration_ms": _percentile(job_durations_ms, 99),
-            "samples": len(job_durations_ms),
+        "spark": {
+            "input_rows_per_second_avg": _safe_mean(input_rates),
+            "processed_rows_per_second_avg": _safe_mean(processing_rates),
+            "trigger_duration_ms_avg": _safe_mean(trigger_durations_ms),
+            "trigger_duration_ms_p95": _percentile(trigger_durations_ms, 95),
+            "batch_samples": len(trigger_durations_ms),
         },
     }
 
@@ -213,9 +179,10 @@ def _print_summary(summary: dict, output_path: Path) -> None:
     def fmt(value: float | None, unit: str = "") -> str:
         return f"{value:.2f}{unit}" if value is not None else "n/a"
 
+    ingress = summary.get("telemetry_ingress", {})
     alerts = summary.get("alerts", {})
     lag = summary.get("processing_lag_seconds", {})
-    spark = summary.get("spark_jobs", {})
+    spark = summary.get("spark", {})
 
     print()
     print("=" * 56)
@@ -224,6 +191,9 @@ def _print_summary(summary: dict, output_path: Path) -> None:
     print(f" run_ts             : {summary.get('run_ts')}")
     print(f" fleet_size         : {summary.get('fleet_size')}")
     print(f" duration_seconds   : {summary.get('duration_seconds')}")
+    print("-" * 56)
+    print(f" telemetry_events   : {ingress.get('total_events', 0)}")
+    print(f" events_per_second  : {fmt(ingress.get('events_per_second'), ' ev/s')}")
     print("-" * 56)
     print(f" alerts_total       : {alerts.get('total', 0)}")
     print(f" alerts_per_second  : {fmt(alerts.get('per_second'), ' alerts/s')}")
@@ -234,12 +204,12 @@ def _print_summary(summary: dict, output_path: Path) -> None:
     print(f" lag_p95            : {fmt(lag.get('p95'), 's')}")
     print(f" lag_p99            : {fmt(lag.get('p99'), 's')}")
     print(f" lag_samples        : {lag.get('samples', 0)}")
-    print(f" lag_skip_missing   : {lag.get('skipped_missing_fields', 0)}")
-    print(f" lag_skip_parse     : {lag.get('skipped_parse_failures', 0)}")
-    print(f" lag_skip_negative  : {lag.get('skipped_negative_lag', 0)}")
     print("-" * 56)
-    print(f" spark_avg_job_ms   : {fmt(spark.get('avg_duration_ms'), ' ms')}")
-    print(f" spark_p95_job_ms   : {fmt(spark.get('p95_duration_ms'), ' ms')}")
+    print(f" spark_input_rps    : {fmt(spark.get('input_rows_per_second_avg'), ' rows/s')}")
+    print(f" spark_process_rps  : {fmt(spark.get('processed_rows_per_second_avg'), ' rows/s')}")
+    print(f" spark_trigger_ms   : {fmt(spark.get('trigger_duration_ms_avg'), ' ms')}")
+    print(f" spark_trigger_p95  : {fmt(spark.get('trigger_duration_ms_p95'), ' ms')}")
+    print(f" spark_batch_samples: {spark.get('batch_samples', 0)}")
     print("-" * 56)
     print(f" results written to : {output_path}")
     print("=" * 56)

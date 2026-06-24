@@ -1,7 +1,10 @@
+import json
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from pyspark.sql import SparkSession
+from pyspark.sql.streaming import StreamingQueryListener
 from pyspark.sql.functions import (
     avg,
     col,
@@ -23,6 +26,30 @@ from pyspark.sql.types import (
     StructType,
     TimestampType,
 )
+
+_PROGRESS_FILE = Path("/tmp/logishield-spark-progress.jsonl")
+
+
+class _ProgressWriter(StreamingQueryListener):
+    def onQueryStarted(self, event):
+        _PROGRESS_FILE.write_text("")
+
+    def onQueryProgress(self, event):
+        p = event.progress
+        record = {
+            "timestamp": p.timestamp,
+            "batchId": p.batchId,
+            "inputRowsPerSecond": p.inputRowsPerSecond,
+            "processedRowsPerSecond": p.processedRowsPerSecond,
+            "numInputRows": p.numInputRows,
+            "durationMs": p.durationMs,
+        }
+        with _PROGRESS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def onQueryTerminated(self, event):
+        pass
+
 
 TELEMETRY_SCHEMA = StructType([
     StructField("event_id", StringType(), True),
@@ -47,6 +74,7 @@ def run():
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
+    spark.streams.addListener(_ProgressWriter())
 
     raw_stream = (
         spark.readStream.format("kafka")
@@ -85,12 +113,12 @@ def run():
         col("sla_time_remaining") - col("time_left_to_destination"),
     )
 
-    watermarked = with_metrics.withWatermark("event_ts", "5 minutes")
+    watermarked = with_metrics.withWatermark("event_ts", "1 minute")
 
     windowed = (
         watermarked
         .groupBy(
-            window(col("event_ts"), "10 minutes", "30 seconds"),
+            window(col("event_ts"), "5 minutes", "30 seconds"),
             col("vehicle_id"),
         )
         .agg(
