@@ -167,6 +167,25 @@ The **LogiShield Pipeline** is a real-time logistics risk detection system that 
 
 ---
 
+### Decision 14: TTL-Based GREEN State Recovery for Redis Fleet State (Phase 7)
+
+**Context:** The `risk-alerts` Kafka topic only receives YELLOW and RED transitions. GREEN is filtered out in Spark before reaching Kafka (`alerts = tiered.filter(col("risk_tier") != "GREEN")`). A Redis state consumer reading only `risk-alerts` has no signal for when a truck returns to GREEN. Without handling this, a truck that was RED and recovers will remain RED in Redis indefinitely, and `fleet:counts` will accumulate inflated YELLOW/RED counts over time.
+
+**Options considered:**
+1. Emit GREEN transitions to `risk-alerts` — modifying the Spark pipeline so the topic becomes a full state-change stream
+2. TTL-based expiry on `truck:{vehicle_id}` keys in Redis
+3. A separate reconciliation process that periodically recomputes state from Kafka history
+
+**The Decision:** Use TTL-based key expiry on `truck:{vehicle_id}` Redis keys. TTL is set to `window_duration + watermark + safety_buffer = 5 min + 1 min + 1 min = 7 minutes`. If a truck returns to GREEN, no further alerts are emitted and the key expires naturally after ~7 minutes.
+
+**Justification:** Emitting GREEN transitions is the most complete solution but changes the semantics of `risk-alerts` from an alert-only stream to a full state-change stream — a significant architectural shift. The TTL approach requires zero changes to the existing pipeline, is simple to reason about, and provides an acceptable approximation: Redis reflects *active non-GREEN alert state*, not complete fleet state. The 7-minute expiry window is long enough that a truck actively in YELLOW or RED will be refreshed well before expiry (alerts fire on tier changes; a sustained risk state will produce at least one alert per window close, every ~66 seconds), and short enough that recovered trucks are purged within one observation window.
+
+**Explicit limitation:** Redis materializes active non-GREEN alert state, not the complete fleet state. A truck absent from Redis has either never generated an alert, or returned to GREEN and had its key expire. `fleet:counts` reflects trucks with active YELLOW/RED alerts only, not total fleet size.
+
+**Future enhancement path:** Emit GREEN state transitions as a distinct event type in `risk-alerts` (or a dedicated topic) to support full fleet-state materialization without expiration-based cleanup. This would allow Redis to hold the definitive current tier for every vehicle regardless of recovery timing, and is the correct approach before any production dashboard is built.
+
+---
+
 ### Known Issue 1: YELLOW Alerts Eclipsed by RED in Long-Running Windows
 
 **Observed:** During Phase 3E validation, only RED alerts appeared in `risk-alerts`. No YELLOW alerts were produced despite the simulator cycling through YELLOW states.
