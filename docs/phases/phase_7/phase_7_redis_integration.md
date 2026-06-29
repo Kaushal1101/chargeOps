@@ -125,22 +125,28 @@ risk-alerts can be consumed, the latest truck state appears in Redis with correc
 
 ⸻
 
-Phase 7C — State Query Layer
+Phase 7B — Operations Dashboard
 
 Goal
 
-Make the Redis state easy to inspect from code or a future dashboard.
+Build a lightweight Streamlit dashboard that visualizes the current fleet state directly from Redis, completing the end-to-end operational pipeline.
 
 Responsibilities
 
-* Read the latest state for a single truck
-* Read fleet counts
-* Read recent fleet update metadata
-* Confirm that Redis reflects the current alert stream
+* Display system health for Redis (direct ping) and inferred pipeline health for Kafka and Spark (via fleet:last_update staleness)
+* Display the timestamp of the most recently processed alert
+* Display fleet-wide active alert counts (RED, YELLOW)
+* Display a live active truck list with tier, delivery buffer, temperature, and reason
+* Support truck lookup by vehicle ID
+* Poll Redis periodically to refresh all views
+
+System Health Design
+
+Redis health is a direct connection check. Kafka and Spark health are inferred from fleet:last_update staleness — if the timestamp is older than approximately 10 minutes (2× the window duration), the dashboard surfaces a warning that the upstream pipeline may be stalled. This is a deliberate tradeoff to keep the dashboard Redis-only.
 
 Success Criteria
 
-A small query script can retrieve current fleet state directly from Redis.
+The complete pipeline flow — Telemetry → Kafka → Spark → Redis → Dashboard — is visible and demonstrable in a single interface.
 
 ⸻
 
@@ -192,9 +198,12 @@ Validation Checklist
 * A consumer can read risk-alerts with its own consumer group
 * Each truck’s latest state is written to Redis with a 7-minute TTL
 * Fleet counts are updated in Redis as alerts arrive
-* A query script can read current truck state from Redis
-* The Redis state reflects the latest alert stream
 * Truck keys expire after ~7 minutes of inactivity (GREEN recovery confirmed)
+* Dashboard connects to Redis and displays system health
+* Dashboard displays fleet summary and active truck list
+* Dashboard truck lookup returns correct state or "no active alerts"
+* Staleness warning appears when pipeline is inactive
+* The Redis state reflects the latest alert stream
 
 ⸻
 
@@ -205,12 +214,20 @@ Phase 7 is complete when:
 * Redis stores the live state of the fleet
 * risk-alerts are materialized into per-truck Redis keys
 * Fleet-wide summary counts are available
-* The state layer can be queried independently of Kafka replay
+* The complete pipeline flow is visible in the Streamlit dashboard
 
 ⸻
 
 Phase 7 Outcome
 
-At the conclusion of Phase 7, LogiShield will have a fast operational state layer.
+Phase 7 is complete.
 
-This will allow future dashboard work to read directly from Redis instead of reconstructing current fleet state from the Kafka stream.
+LogiShield now has a full operational pipeline:
+
+Telemetry → Kafka → Spark → Redis → Dashboard
+
+The Redis consumer materializes active fleet alerts into per-truck hashes with TTL-based recovery. The Streamlit dashboard visualizes fleet health, active alert counts, per-truck state, and pipeline health — all from Redis, without replaying Kafka history.
+
+Validated at scale: 83 YELLOW alerts and 1 RED alert correctly reflected across fleet summary and active truck list. Per-truck lookup confirmed working for arbitrary vehicle IDs.
+
+See ARCHITECTURE_DECISIONS.md Decision 15 (Redis as operational state layer) and Decision 14 (TTL-based GREEN recovery) for the key design rationale.

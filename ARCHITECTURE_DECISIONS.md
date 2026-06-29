@@ -186,6 +186,28 @@ The **LogiShield Pipeline** is a real-time logistics risk detection system that 
 
 ---
 
+### Decision 15: Redis as the Operational State Layer (Phase 7)
+
+**Context:** After Phase 6, LogiShield could detect risk in real time and benchmark throughput, but had no way to answer "what is the current state of the fleet?" without replaying Kafka history. The risk alert stream is event-based — it records when risk changes, not what the current state is. A dashboard or operations interface needs a fast, queryable snapshot of current state.
+
+**Options considered:**
+1. Query Kafka directly — replay `risk-alerts` from offset 0 to reconstruct current state on every request
+2. Write per-truck state to PostgreSQL after each alert
+3. Write per-truck state to Redis after each alert
+
+**The Decision:** Redis as a materialized view of active fleet state, populated by a lightweight consumer reading from `risk-alerts`.
+
+**Justification:**
+- **Kafka is the wrong tool for state queries.** Replaying the event log to answer a current-state question defeats the purpose of streaming — it trades a O(1) lookup for O(n) replay. Kafka is the source of truth for *what happened*; it should not be the query layer for *what is true now*.
+- **PostgreSQL adds unnecessary complexity.** A relational database is the right choice when you need joins, history, or complex queries. The current-state use case is purely key-value: given a vehicle ID, return its latest alert fields. PostgreSQL's schema management, connection pooling, and write overhead are not justified here.
+- **Redis maps naturally to the data model.** One Redis Hash per truck (`truck:{vehicle_id}`) maps directly to the alert payload. Lookups are O(1) by key. Fleet-wide counts fit in a single Hash (`fleet:counts`). The entire operational state layer can be expressed in three key patterns.
+- **TTL is a native Redis feature.** The GREEN recovery problem — Spark does not emit GREEN transitions, so stale YELLOW/RED keys would accumulate — is solved by Redis key expiry without any pipeline changes. See Decision 14.
+- **The three layers are complementary with no overlap.** Kafka owns event history. Spark owns stream processing and risk detection. Redis owns current operational state. Each answers a different class of question; none duplicates another.
+
+**Result:** A downstream Redis consumer (`redis_consumer/state_consumer.py`) reads `risk-alerts` and materializes per-truck state with a 7-minute TTL. A Streamlit dashboard (`dashboard/app.py`) reads exclusively from Redis and visualizes fleet health, active alerts, and per-truck state — completing the end-to-end operational flow without touching the existing pipeline.
+
+---
+
 ### Known Issue 1: YELLOW Alerts Eclipsed by RED in Long-Running Windows
 
 **Observed:** During Phase 3E validation, only RED alerts appeared in `risk-alerts`. No YELLOW alerts were produced despite the simulator cycling through YELLOW states.
