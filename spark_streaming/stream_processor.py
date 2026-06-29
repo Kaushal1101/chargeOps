@@ -12,6 +12,8 @@ from pyspark.sql.functions import (
     first,
     from_json,
     lit,
+    max,
+    min,
     struct,
     to_json,
     udf,
@@ -68,6 +70,10 @@ TELEMETRY_SCHEMA = StructType([
     StructField("customer_priority", StringType(), True),
     StructField("service_level", StringType(), True),
     StructField("destination_region", StringType(), True),
+    StructField("route_progress", DoubleType(), True),
+    StructField("estimated_arrival_minutes", IntegerType(), True),
+    StructField("remaining_stops", IntegerType(), True),
+    StructField("driver_hours_remaining", DoubleType(), True),
 ])
 
 
@@ -116,6 +122,10 @@ def run():
         col("data.customer_priority"),
         col("data.service_level"),
         col("data.destination_region"),
+        col("data.route_progress"),
+        col("data.estimated_arrival_minutes"),
+        col("data.remaining_stops"),
+        col("data.driver_hours_remaining"),
         col("topic"),
         col("partition"),
         col("offset"),
@@ -147,6 +157,10 @@ def run():
             first(col("customer_priority")).alias("customer_priority"),
             first(col("service_level")).alias("service_level"),
             first(col("destination_region")).alias("destination_region"),
+            max(col("route_progress")).alias("max_route_progress"),
+            min(col("remaining_stops")).alias("min_remaining_stops"),
+            min(col("driver_hours_remaining")).alias("min_driver_hours_remaining"),
+            min(col("estimated_arrival_minutes")).alias("min_estimated_arrival_minutes"),
         )
     )
 
@@ -217,9 +231,13 @@ def run():
         col("customer_priority"),
         col("service_level"),
         col("destination_region"),
+        col("max_route_progress").alias("route_progress"),
+        col("min_remaining_stops").alias("remaining_stops"),
+        col("min_driver_hours_remaining").alias("driver_hours_remaining"),
+        col("min_estimated_arrival_minutes").alias("estimated_arrival_minutes"),
     )
 
-    last_tiers: dict[str, str] = {}
+    last_tiers: dict[tuple[str, str], str] = {}
 
     def write_on_transition(batch_df, batch_id):
         if batch_df.rdd.isEmpty():
@@ -229,9 +247,11 @@ def run():
         new_alerts = []
         for row in rows:
             vid = row["vehicle_id"]
+            trip_id = row["trip_id"]
             tier = row["risk_tier"]
-            if last_tiers.get(vid) != tier:
-                last_tiers[vid] = tier
+            key = (vid, trip_id)
+            if last_tiers.get(key) != tier:
+                last_tiers[key] = tier
                 new_alerts.append(row)
 
         if not new_alerts:

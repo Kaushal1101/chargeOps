@@ -220,6 +220,18 @@ The **LogiShield Pipeline** is a real-time logistics risk detection system that 
 
 ---
 
+### Decision 17: Transition Detection Keyed on (vehicle_id, trip_id) (Phase 8B)
+
+**Context:** `write_on_transition` in Spark suppresses duplicate alerts by tracking the last emitted tier per truck in a `last_tiers` dict. Originally keyed on `vehicle_id` alone. With the Phase 8A trip lifecycle, trucks complete trips, go idle, and start new trips. If a truck's second trip produces the same risk tier as its first, `write_on_transition` sees no change and silently drops the alert — leaving Redis and the dashboard stale until Spark restarts.
+
+**The Decision:** Key `last_tiers` on `(vehicle_id, trip_id)` instead of `vehicle_id`.
+
+**Justification:** Each `trip_id` is a UUID assigned at trip start. Using it as part of the transition key means every new trip is treated as a fresh alert context regardless of prior tier history. The fix is a one-line change with no impact on the deduplication behavior within a single trip.
+
+**Observed failure:** Confirmed in Phase 8B testing — trucks re-entering IN_TRANSIT on their second trip generated no Redis updates and the dashboard remained empty until Spark was restarted.
+
+---
+
 ### Known Issue 1: YELLOW Alerts Eclipsed by RED in Long-Running Windows
 
 **Observed:** During Phase 3E validation, only RED alerts appeared in `risk-alerts`. No YELLOW alerts were produced despite the simulator cycling through YELLOW states.

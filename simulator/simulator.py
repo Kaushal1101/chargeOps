@@ -69,6 +69,9 @@ class TripContext:
     customer_priority: str
     service_level: str
     destination_region: str
+    remaining_stops_initial: int
+    shift_hours: float
+    trip_start_time: float
 
     @classmethod
     def generate(cls) -> "TripContext":
@@ -79,6 +82,9 @@ class TripContext:
             customer_priority=random.choice(_CUSTOMER_PRIORITIES),
             service_level=random.choice(_SERVICE_LEVELS),
             destination_region=random.choice(_DESTINATION_REGIONS),
+            remaining_stops_initial=max(1, random.randint(1, 5)),
+            shift_hours=round(random.uniform(8.0, 11.0), 4),
+            trip_start_time=0.0,
         )
 
 
@@ -109,6 +115,7 @@ class Vehicle:
             self._state_deadline = now + random.uniform(60, 180)
         elif self.trip_state == "LOADING":
             self.trip_state = "IN_TRANSIT"
+            self._trip_context.trip_start_time = now
             self._state_deadline = now + random.uniform(300, 900)
         elif self.trip_state == "IN_TRANSIT":
             self.trip_state = "DELIVERY_COMPLETE"
@@ -118,11 +125,44 @@ class Vehicle:
             self._trip_context = None
             self._state_deadline = now + random.uniform(30, 90)
 
+    def _compute_dynamic_fields(self) -> dict:
+        if self.trip_state != "IN_TRANSIT" or self._trip_context is None:
+            return {
+                "route_progress": 0.0,
+                "estimated_arrival_minutes": 0,
+                "remaining_stops": 0,
+                "driver_hours_remaining": 0.0,
+            }
+
+        ctx = self._trip_context
+        elapsed = time.time() - ctx.trip_start_time
+        trip_duration = self._state_deadline - ctx.trip_start_time
+        trip_duration = max(trip_duration, 1.0)
+
+        route_progress = min(elapsed / trip_duration, 1.0)
+
+        trip_duration_minutes = trip_duration / 60.0
+        estimated_arrival_minutes = max(0, round((1.0 - route_progress) * trip_duration_minutes))
+
+        threshold_interval = 1.0 / ctx.remaining_stops_initial
+        stops_completed = int(route_progress / threshold_interval)
+        remaining_stops = max(0, ctx.remaining_stops_initial - stops_completed)
+
+        driver_hours_remaining = max(0.0, ctx.shift_hours - (elapsed / 3600.0))
+
+        return {
+            "route_progress": round(route_progress, 4),
+            "estimated_arrival_minutes": estimated_arrival_minutes,
+            "remaining_stops": remaining_stops,
+            "driver_hours_remaining": round(driver_hours_remaining, 4),
+        }
+
     def current_scenario(self) -> Scenario:
         return Scenario.from_step(self._step)
 
     def generate_event(self, event_ts: datetime | None = None) -> TelemetryEvent:
         self._maybe_advance_lifecycle()
+        dynamic = self._compute_dynamic_fields()
 
         if self.trip_state == "IN_TRANSIT":
             scenario = self.current_scenario()
@@ -159,6 +199,10 @@ class Vehicle:
             customer_priority=ctx.customer_priority if ctx else "",
             service_level=ctx.service_level if ctx else "",
             destination_region=ctx.destination_region if ctx else "",
+            route_progress=dynamic["route_progress"],
+            estimated_arrival_minutes=dynamic["estimated_arrival_minutes"],
+            remaining_stops=dynamic["remaining_stops"],
+            driver_hours_remaining=dynamic["driver_hours_remaining"],
         )
 
     def advance(self) -> None:

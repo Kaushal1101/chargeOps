@@ -21,6 +21,10 @@ class TelemetryEvent(BaseModel):
     customer_priority: str
     service_level: str
     destination_region: str
+    route_progress: float
+    estimated_arrival_minutes: int
+    remaining_stops: int
+    driver_hours_remaining: float
 
     def to_json_bytes(self) -> bytes:
         return json.dumps(self.model_dump()).encode("utf-8")
