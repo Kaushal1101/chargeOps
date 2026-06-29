@@ -83,6 +83,12 @@ def run(verbose: bool = False) -> None:
                     "window_end": alert.get("window_end", ""),
                     "alert_ts": alert.get("alert_ts", ""),
                     "reason": alert.get("reason", ""),
+                    "trip_id": alert.get("trip_id", ""),
+                    "cargo_type": alert.get("cargo_type", ""),
+                    "cargo_value": str(alert.get("cargo_value", "")),
+                    "customer_priority": alert.get("customer_priority", ""),
+                    "service_level": alert.get("service_level", ""),
+                    "destination_region": alert.get("destination_region", ""),
                 },
             )
             r.expire(truck_key, TRUCK_KEY_TTL_SECONDS)

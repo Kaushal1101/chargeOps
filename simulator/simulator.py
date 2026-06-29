@@ -4,6 +4,7 @@ import random
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -13,6 +14,17 @@ from kafka.errors import KafkaError
 from simulator.models import TelemetryEvent
 
 TOPIC = "fleet-telemetry"
+
+_CARGO_TYPES = [
+    "Pharmaceuticals",
+    "Fresh Food",
+    "Frozen Goods",
+    "Electronics",
+    "General Freight",
+]
+_CUSTOMER_PRIORITIES = ["Standard", "Priority", "Critical"]
+_SERVICE_LEVELS = ["Standard", "Express", "Same-Day"]
+_DESTINATION_REGIONS = ["North", "South", "East", "West"]
 
 
 class Scenario:
@@ -49,6 +61,27 @@ class Scenario:
         }
 
 
+@dataclass
+class TripContext:
+    trip_id: str
+    cargo_type: str
+    cargo_value: float
+    customer_priority: str
+    service_level: str
+    destination_region: str
+
+    @classmethod
+    def generate(cls) -> "TripContext":
+        return cls(
+            trip_id=str(uuid.uuid4()),
+            cargo_type=random.choice(_CARGO_TYPES),
+            cargo_value=round(random.uniform(5000.0, 500000.0), 2),
+            customer_priority=random.choice(_CUSTOMER_PRIORITIES),
+            service_level=random.choice(_SERVICE_LEVELS),
+            destination_region=random.choice(_DESTINATION_REGIONS),
+        )
+
+
 class Vehicle:
     def __init__(
         self,
@@ -62,20 +95,53 @@ class Vehicle:
         self.sla_buffer_threshold = sla_buffer_threshold
         self.interval_seconds = interval_seconds
         self._step: int = 0
+        self.trip_state: str = "IDLE"
+        self._state_deadline: float = time.time() + random.uniform(30, 90)
+        self._trip_context: TripContext | None = None
+
+    def _maybe_advance_lifecycle(self) -> None:
+        now = time.time()
+        if now < self._state_deadline:
+            return
+        if self.trip_state == "IDLE":
+            self.trip_state = "LOADING"
+            self._trip_context = TripContext.generate()
+            self._state_deadline = now + random.uniform(60, 180)
+        elif self.trip_state == "LOADING":
+            self.trip_state = "IN_TRANSIT"
+            self._state_deadline = now + random.uniform(300, 900)
+        elif self.trip_state == "IN_TRANSIT":
+            self.trip_state = "DELIVERY_COMPLETE"
+            self._state_deadline = now
+        elif self.trip_state == "DELIVERY_COMPLETE":
+            self.trip_state = "IDLE"
+            self._trip_context = None
+            self._state_deadline = now + random.uniform(30, 90)
 
     def current_scenario(self) -> Scenario:
         return Scenario.from_step(self._step)
 
     def generate_event(self, event_ts: datetime | None = None) -> TelemetryEvent:
-        scenario = self.current_scenario()
-        values = scenario.generate_values(
-            self.cargo_temp_threshold, self.sla_buffer_threshold
-        )
+        self._maybe_advance_lifecycle()
+
+        if self.trip_state == "IN_TRANSIT":
+            scenario = self.current_scenario()
+            values = scenario.generate_values(
+                self.cargo_temp_threshold, self.sla_buffer_threshold
+            )
+        else:
+            scenario = None
+            values = {
+                "cargo_temperature": 0.0,
+                "time_left_to_destination": 0,
+                "sla_time_remaining": 0,
+            }
 
         if event_ts is None:
             event_ts = datetime.now(timezone.utc)
         event_ts_str = event_ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
+        ctx = self._trip_context
         return TelemetryEvent(
             event_id=str(uuid.uuid4()),
             event_ts=event_ts_str,
@@ -83,9 +149,16 @@ class Vehicle:
             cargo_temperature=values["cargo_temperature"],
             time_left_to_destination=values["time_left_to_destination"],
             sla_time_remaining=values["sla_time_remaining"],
-            scenario_state=scenario.state,
+            scenario_state=scenario.state if self.trip_state == "IN_TRANSIT" else "GREEN",
             sla_buffer_threshold=self.sla_buffer_threshold,
             cargo_temp_threshold=self.cargo_temp_threshold,
+            trip_state=self.trip_state,
+            trip_id=ctx.trip_id if ctx else "",
+            cargo_type=ctx.cargo_type if ctx else "",
+            cargo_value=ctx.cargo_value if ctx else 0.0,
+            customer_priority=ctx.customer_priority if ctx else "",
+            service_level=ctx.service_level if ctx else "",
+            destination_region=ctx.destination_region if ctx else "",
         )
 
     def advance(self) -> None:
@@ -194,7 +267,9 @@ def worker(shard: list[Vehicle], producer: KafkaProducer, stop: threading.Event)
             value=event.to_json_bytes(),
         )
         print(
-            f"[{vehicle.vehicle_id}] {vehicle.current_scenario().state} | interval={vehicle.interval_seconds}s | event_ts={event.event_ts}"
+            f"[{vehicle.vehicle_id}] {vehicle.trip_state} | "
+            f"{vehicle.current_scenario().state} | interval={vehicle.interval_seconds}s | "
+            f"event_ts={event.event_ts}"
         )
         _record_event()  # DIAGNOSTIC
         vehicle.advance()

@@ -21,6 +21,8 @@ TIER_SORT_ORDER = {"RED": 0, "YELLOW": 1}
 TRUCK_COLUMNS = [
     "vehicle_id",
     "tier",
+    "cargo_type",
+    "customer_priority",
     "delivery_buffer",
     "avg_temperature",
     "reason",

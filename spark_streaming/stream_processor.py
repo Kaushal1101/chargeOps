@@ -61,6 +61,13 @@ TELEMETRY_SCHEMA = StructType([
     StructField("scenario_state", StringType(), True),
     StructField("sla_buffer_threshold", IntegerType(), True),
     StructField("cargo_temp_threshold", DoubleType(), True),
+    StructField("trip_state", StringType(), True),
+    StructField("trip_id", StringType(), True),
+    StructField("cargo_type", StringType(), True),
+    StructField("cargo_value", DoubleType(), True),
+    StructField("customer_priority", StringType(), True),
+    StructField("service_level", StringType(), True),
+    StructField("destination_region", StringType(), True),
 ])
 
 
@@ -102,6 +109,13 @@ def run():
         col("data.scenario_state"),
         col("data.sla_buffer_threshold"),
         col("data.cargo_temp_threshold"),
+        col("data.trip_state"),
+        col("data.trip_id"),
+        col("data.cargo_type"),
+        col("data.cargo_value"),
+        col("data.customer_priority"),
+        col("data.service_level"),
+        col("data.destination_region"),
         col("topic"),
         col("partition"),
         col("offset"),
@@ -113,7 +127,8 @@ def run():
         col("sla_time_remaining") - col("time_left_to_destination"),
     )
 
-    watermarked = with_metrics.withWatermark("event_ts", "1 minute")
+    in_transit = with_metrics.filter(col("trip_state") == "IN_TRANSIT")
+    watermarked = in_transit.withWatermark("event_ts", "1 minute")
 
     windowed = (
         watermarked
@@ -126,6 +141,12 @@ def run():
             avg(col("cargo_temperature")).alias("avg_cargo_temperature"),
             first(col("sla_buffer_threshold")).alias("sla_buffer_threshold"),
             first(col("cargo_temp_threshold")).alias("cargo_temp_threshold"),
+            first(col("trip_id")).alias("trip_id"),
+            first(col("cargo_type")).alias("cargo_type"),
+            first(col("cargo_value")).alias("cargo_value"),
+            first(col("customer_priority")).alias("customer_priority"),
+            first(col("service_level")).alias("service_level"),
+            first(col("destination_region")).alias("destination_region"),
         )
     )
 
@@ -190,6 +211,12 @@ def run():
             )
         )
         .alias("reason"),
+        col("trip_id"),
+        col("cargo_type"),
+        col("cargo_value"),
+        col("customer_priority"),
+        col("service_level"),
+        col("destination_region"),
     )
 
     last_tiers: dict[str, str] = {}

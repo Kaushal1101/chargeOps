@@ -208,6 +208,18 @@ The **LogiShield Pipeline** is a real-time logistics risk detection system that 
 
 ---
 
+### Decision 16: IN_TRANSIT Filter Before Windowed Aggregation (Phase 8A)
+
+**Context:** Phase 8A introduced a four-state truck lifecycle (IDLE, LOADING, IN_TRANSIT, DELIVERY_COMPLETE). All states emit telemetry events to `fleet-telemetry`. Without filtering, Spark's windowed aggregation would include events from idle and loading trucks — producing delivery buffer and temperature readings of 0.0 that could trigger spurious YELLOW or RED alerts for trucks not on an active delivery leg.
+
+**The Decision:** Filter to `trip_state == IN_TRANSIT` in Spark before the `.withWatermark()` call, so only in-transit events enter the windowed aggregation path.
+
+**Justification:** The filter must happen before watermarking and windowing, not after. Filtering after aggregation would still waste compute aggregating meaningless sensor values and could produce misleading window averages that mix real delivery telemetry with idle placeholder values (0.0). Filtering before aggregation ensures the risk computation only ever sees operationally meaningful data. This also keeps the risk logic itself unchanged — the thresholds, tier classification, and transition detection are all unmodified; the only change is which events are fed into the computation.
+
+**Consequence:** A truck that transitions from IN_TRANSIT to IDLE mid-window will have its remaining events excluded from that window. This is the correct behavior — a truck that has completed its delivery should not continue contributing to an active risk window.
+
+---
+
 ### Known Issue 1: YELLOW Alerts Eclipsed by RED in Long-Running Windows
 
 **Observed:** During Phase 3E validation, only RED alerts appeared in `risk-alerts`. No YELLOW alerts were produced despite the simulator cycling through YELLOW states.
