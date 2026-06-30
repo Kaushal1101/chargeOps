@@ -854,3 +854,261 @@ Exit criteria satisfied:
 - Kafka and Spark both have headroom at all tested fleet sizes
 - Results saved to `benchmarks/results/` in structured JSON for future Redis comparison
 - Bottleneck identified: Python simulator heap scheduler, not Kafka or Spark
+
+---
+
+## 2026-06-24 — Phase 7 Pre-Work: Redis Service, TTL Design, ADR
+
+### What Was Completed
+
+- `redis:7` service added to `docker-compose.yml` with healthcheck on port 6379
+- `ARCHITECTURE_DECISIONS.md` Decision 14 written: TTL-based GREEN state recovery — `truck:{vehicle_id}` keys expire after 7 minutes so recovered trucks fall out of `fleet:counts` without modifying the Spark pipeline
+- `docs/phases/phase_7/phase_7_redis_integration.md` created: merged Phase 7A/7B design, TTL strategy, and validation checklist
+- Phases 7A and 7B merged into a single implementation plan
+
+### Key Decisions Made
+
+**TTL is the mechanism for GREEN state recovery**
+Spark does not emit GREEN transitions — the `write_on_transition` filter only passes YELLOW and RED alerts to `risk-alerts`. This means Redis would accumulate stale YELLOW/RED keys forever for trucks that have recovered. The solution: set a 7-minute TTL on every `truck:{vehicle_id}` key, refreshed on each alert. A truck that goes quiet (because Spark is no longer generating alerts for it) will have its key expire naturally. 7 minutes = 5-minute window + 1-minute watermark + ~1 minute of write overhead — the minimum time before a key can legitimately go stale.
+
+**Phases 7A and 7B merged**
+The original plan split Redis consumer (7A) and Streamlit dashboard (7B) into sequential phases. Because the consumer and dashboard are independent components with no shared code, they were implemented together in a single pass.
+
+---
+
+## 2026-06-29 — Phase 7: Redis State Layer and Streamlit Operations Dashboard
+
+### What Was Completed
+
+- `redis_consumer/state_consumer.py` — lightweight Kafka consumer that reads `risk-alerts` and materializes per-truck state into Redis
+- `dashboard/app.py` — read-only Streamlit operations dashboard that visualizes fleet state from Redis
+- `redis_consumer/__init__.py` — package marker enabling `python -m redis_consumer.state_consumer` entry point
+- `dashboard/__init__.py` — package marker
+- `requirements.txt` updated: `redis==5.0.8`, `streamlit==1.41.1` added
+- `ARCHITECTURE_DECISIONS.md` Decision 15: Redis as the operational state layer
+
+### Redis State Consumer (`redis_consumer/state_consumer.py`)
+
+**Key patterns written:**
+
+| Redis key | Type | Contents | TTL |
+|-----------|------|----------|-----|
+| `truck:{vehicle_id}` | Hash | `vehicle_id`, `tier`, `delivery_buffer`, `avg_temperature`, `window_start`, `window_end`, `alert_ts`, `reason` | 420s |
+| `fleet:counts` | Hash | `RED` count, `YELLOW` count | None (manually maintained) |
+| `fleet:last_update` | Hash | `ts`, `vehicle_id`, `tier` | None |
+
+**Startup reconciliation:** On process start, the consumer rebuilds `fleet:counts` by scanning all `truck:*` keys and summing their tiers. This self-heals any count drift caused by TTL expiry during downtime — the consumer does not need to replay Kafka history to recover a correct count.
+
+**Incremental count update:** When a truck transitions tier (e.g. YELLOW → RED), the consumer decrements the old tier count and increments the new one in the same write. No full scan needed per message.
+
+**Consumer group:** Uses its own Kafka consumer group (`logishield-redis-state`), independent of any benchmarking or Spark consumer. Starts from `latest` — does not replay historical alerts.
+
+### Streamlit Dashboard (`dashboard/app.py`)
+
+Four sections:
+
+1. **System Health** — Redis ping + pipeline staleness (inferred from `fleet:last_update.ts` compared to wall clock; stale threshold = 600s)
+2. **Fleet Summary** — RED and YELLOW metric tiles from `fleet:counts`
+3. **Active Trucks** — table of all `truck:*` hashes, sorted by severity (RED first, then YELLOW), showing `vehicle_id`, `tier`, `delivery_buffer`, `avg_temperature`, `reason`, `last_update`
+4. **Truck Lookup** — free-text input to fetch a single `truck:{vehicle_id}` hash via `r.hgetall()`
+
+The dashboard auto-refreshes every 5 seconds via `time.sleep(5)` + `st.rerun()`. It performs no business logic and never modifies Redis.
+
+**Staleness as a proxy for pipeline health**
+Rather than attempting to ping Kafka or Spark directly (which would require connections the dashboard should not own), the dashboard uses `fleet:last_update.ts` freshness as a signal. If the timestamp is more than 10 minutes old, the pipeline is assumed stalled. This is a deliberate design choice — it keeps the dashboard dependency-free from Kafka and Spark and avoids false negatives from intermittent network latency.
+
+### Validation Results
+
+- Validated with 5,000-truck fleet run
+- `83 YELLOW` and `1 RED` alert correctly reflected in fleet summary metrics
+- Active truck list sorted correctly with RED entry appearing above YELLOW entries
+- Per-truck lookup confirmed working: arbitrary `vehicle_id` input returned full hash
+- Expired truck keys disappeared automatically from the active truck list without any code change or Redis command
+- `fleet:counts` remained consistent with visible truck keys throughout the run
+
+### Run Commands
+
+```bash
+# Terminal 1 — Redis consumer
+python -m redis_consumer.state_consumer
+
+# Terminal 2 — Dashboard
+streamlit run dashboard/app.py
+```
+
+### Phase 7 Complete
+
+The streaming pipeline now has a complete demonstrable end-to-end flow:
+
+**Telemetry → Kafka (`fleet-telemetry`) → Spark → Kafka (`risk-alerts`) → Redis → Dashboard**
+
+Kafka owns event history. Spark owns risk detection. Redis owns current operational state. The dashboard provides a read-only operational view without touching the upstream pipeline or replaying Kafka history.
+
+---
+
+## 2026-06-29 — Phase 8A: Trip Lifecycle, Static Trip Metadata, Spark IN_TRANSIT Filter
+
+### What Was Completed
+
+- `simulator/simulator.py` — four-state trip lifecycle state machine added to `Vehicle`
+- `simulator/simulator.py` — `TripContext` dataclass added with static trip metadata generation
+- `simulator/models.py` — `TelemetryEvent` schema expanded with `trip_state` and six static trip fields
+- `spark_streaming/stream_processor.py` — `IN_TRANSIT` filter added before watermarking; static trip fields propagated through aggregation into `risk-alerts`
+- `redis_consumer/state_consumer.py` — six new trip fields stored in `truck:{vehicle_id}` hashes
+- `dashboard/app.py` — `TRUCK_COLUMNS` updated to surface `cargo_type` and `customer_priority`
+- `ARCHITECTURE_DECISIONS.md` Decision 16: IN_TRANSIT filter rationale
+
+### Trip Lifecycle State Machine
+
+Trucks cycle through four states driven by wall-clock deadlines with jitter:
+
+| State | Duration | Trigger |
+|-------|----------|---------|
+| `IDLE` | 30–90s | Initial state; re-entered after DELIVERY_COMPLETE |
+| `LOADING` | 1–3 min | Begins when IDLE deadline passes; TripContext assigned here |
+| `IN_TRANSIT` | 5–15 min | Begins when LOADING deadline passes; risk telemetry meaningful |
+| `DELIVERY_COMPLETE` | 1 tick | Immediately transitions back to IDLE |
+
+`_maybe_advance_lifecycle()` is called at the top of `generate_event()`. It checks `time.time() >= self._state_deadline` and advances the state machine if true. The state machine requires no explicit FSM framework — a sequence of `if/elif` blocks on `self.trip_state` is sufficient.
+
+### TripContext Dataclass
+
+`TripContext` is a Python `dataclass` assigned at the moment the truck enters `LOADING` (not `IN_TRANSIT`) so that static metadata is stable before the first in-transit event is emitted.
+
+Fields assigned at creation:
+
+| Field | Values |
+|-------|--------|
+| `trip_id` | UUID4 |
+| `cargo_type` | Pharmaceuticals / Fresh Food / Frozen Goods / Electronics / General Freight |
+| `cargo_value` | $5,000–$500,000 |
+| `customer_priority` | Standard / Priority / Critical |
+| `service_level` | Standard / Express / Same-Day |
+| `destination_region` | North / South / East / West |
+
+Fields are immutable for the trip duration. When a truck re-enters `IDLE`, `self._trip_context` is set to `None`.
+
+### Event Schema Changes
+
+`TelemetryEvent` now carries `trip_state` plus all six `TripContext` fields. Non-IN_TRANSIT events emit empty strings / `0.0` for context fields where no `TripContext` exists.
+
+### Spark Changes
+
+**Filter before watermark:** `in_transit = with_metrics.filter(col("trip_state") == "IN_TRANSIT")` is applied before `.withWatermark()`. This ensures that IDLE, LOADING, and DELIVERY_COMPLETE events never enter the windowed aggregation path and cannot produce spurious alerts from their `delivery_buffer = 0.0` and `cargo_temperature = 0.0` values.
+
+**Static field propagation:** All six trip fields added to the `.select()` after `from_json`, aggregated with `first()` in the windowed `.agg()`, and included in `alert_records`. They now appear in every `risk-alerts` message alongside the existing risk fields.
+
+### Key Design Decisions
+
+**Filter at `trip_state`, not at value level**
+An alternative was to filter events where `delivery_buffer == 0.0` or `cargo_temperature == 0.0`. This would be fragile — a legitimate IN_TRANSIT event could theoretically have these values near zero during a GREEN phase. Filtering on `trip_state == "IN_TRANSIT"` is semantically correct and explicit.
+
+**`TripContext` assigned at LOADING, not IN_TRANSIT**
+If assigned at IN_TRANSIT, the first emitted in-transit event would have no context yet (race condition). Assigning at LOADING gives the context one full state duration to be stable before any in-transit events are emitted.
+
+**`first()` for static fields in aggregation**
+Trip metadata is constant within a trip — all events in a window share the same `trip_id`, `cargo_type`, etc. `first()` correctly captures this: any row in the window will have the same value, so the first one is authoritative.
+
+### Validation Results
+
+- Trucks confirmed cycling through all four states in terminal output
+- IDLE/LOADING/DELIVERY_COMPLETE events confirmed not producing any alerts in `risk-alerts`
+- IN_TRANSIT events producing YELLOW/RED alerts as expected
+- `cargo_type`, `customer_priority`, `trip_id`, and other static fields confirmed present in `risk-alerts` messages
+- Dashboard active truck list showed `cargo_type` and `customer_priority` columns populated correctly
+- Per-truck lookup returned full enriched records including all six trip fields
+
+### Phase 8A Complete
+
+LogiShield no longer runs a single endless telemetry loop. Each truck now follows a realistic delivery lifecycle. The risk pipeline operates only on operationally meaningful events. The system is ready for dynamic operational fields in Phase 8B.
+
+---
+
+## 2026-06-29 — Phase 8B: Dynamic Operational Fields and Trip-Scoped Alert Deduplication
+
+### What Was Completed
+
+- `simulator/models.py` — four dynamic fields added to `TelemetryEvent`: `route_progress`, `estimated_arrival_minutes`, `remaining_stops`, `driver_hours_remaining`
+- `simulator/simulator.py` — `TripContext` extended with `remaining_stops_initial`, `shift_hours`, `trip_start_time`; `_compute_dynamic_fields()` method added to `Vehicle`
+- `spark_streaming/stream_processor.py` — schema, select, aggregation, and alert payload updated for all four dynamic fields; `last_tiers` key changed from `vehicle_id` to `(vehicle_id, trip_id)`
+- `ARCHITECTURE_DECISIONS.md` Decision 17: transition detection key rationale
+
+### Dynamic Fields
+
+Four fields are computed on every IN_TRANSIT event from fixed formulas:
+
+| Field | Formula | Aggregation in Spark |
+|-------|---------|----------------------|
+| `route_progress` | `elapsed / trip_duration`, clamped to `[0, 1]` | `max()` — furthest point reached in window |
+| `estimated_arrival_minutes` | `(1 - route_progress) × trip_duration_minutes`, rounded | `min()` — shortest remaining time in window |
+| `remaining_stops` | `initial_stops - int(route_progress / threshold_interval)` | `min()` — fewest stops remaining in window |
+| `driver_hours_remaining` | `shift_hours - elapsed_hours` | `min()` — most depleted value in window |
+
+`trip_start_time` is set to `time.time()` at the exact moment the truck enters IN_TRANSIT (not when LOADING begins), so `elapsed` is accurate from first in-transit event.
+
+During non-IN_TRANSIT states: all four fields emit `0.0` / `0`.
+
+### Aggregation Strategy: max/min over first
+
+Dynamic fields change during the window. `first()` would capture the start-of-window value — the stalest possible reading. Instead:
+- `max(route_progress)` captures the truck's furthest position during the window
+- `min(remaining_stops)`, `min(driver_hours_remaining)`, `min(estimated_arrival_minutes)` capture the most operationally conservative (worst-case) values
+
+This means the alert payload reflects the state of the truck at the end of the window rather than the beginning, which is more actionable for operations teams.
+
+### Bug Fixed: Trip-Scoped Alert Deduplication
+
+**The bug:** `write_on_transition` tracked `last_tiers` as `dict[str, str]` keyed on `vehicle_id`. After Phase 8A, trucks complete trips and start new ones. If truck `TRUCK_0001` emitted a `RED` alert on trip 1, went idle, and then re-entered `IN_TRANSIT` on trip 2 — also generating a `RED` alert — `write_on_transition` would see `last_tiers["TRUCK_0001"] == "RED"` unchanged and suppress the alert entirely. Redis and the dashboard would remain stale until Spark restarted.
+
+**Confirmed in validation:** Trucks on their second trip generated no Redis updates. Dashboard remained empty.
+
+**The fix:** Changed `last_tiers` to `dict[tuple[str, str], str]` keyed on `(vehicle_id, trip_id)`. Each UUID `trip_id` is unique, so every new trip is guaranteed to emit at least one alert on first tier classification, regardless of what the previous trip's final tier was.
+
+**Impact:** One-line change to the key expression and the type annotation. Deduplication behavior within a single trip is identical.
+
+### Validation Results
+
+- `route_progress` confirmed advancing from `0.0` toward `1.0` across successive windows
+- `estimated_arrival_minutes` confirmed decreasing as `route_progress` increases
+- `remaining_stops` confirmed decrementing at correct thresholds
+- `driver_hours_remaining` confirmed decreasing during transit and resetting to a new value on each new trip
+- Dynamic fields confirmed `0 / 0.0` during IDLE, LOADING, DELIVERY_COMPLETE
+- All four fields confirmed present in `risk-alerts` messages
+- Trip-scoped deduplication fix confirmed: trucks on second/third trips now generate alerts correctly
+- Existing risk logic (delivery_buffer threshold, avg_temperature threshold, tier classification) unchanged
+
+### Phase 8B Complete
+
+The telemetry stream now carries realistic, time-varying operational context on every IN_TRANSIT event. Each alert in `risk-alerts` contains a full operational snapshot: risk tier, delivery urgency, cargo details, route progress, stops remaining, driver hours, and trip identity. Redis consumer and dashboard column updates for the new dynamic fields are deferred to Phase 8C.
+
+---
+
+## 2026-06-30 — Phase 8C Pre-Work: Schema Propagation Plan
+
+### What Was Completed
+
+- `docs/phases/phase_8/phase_8c.md` — full Phase 8C plan written: scope, fields to propagate, Spark/Redis/dashboard change specifications, validation checklist, and exit criteria
+
+### What Phase 8C Addresses
+
+Phases 8A and 8B completed all Spark-side work: the telemetry schema is fully expanded, the IN_TRANSIT filter is in place, and all enriched fields (static trip context + dynamic operational fields) flow through Spark into `risk-alerts`. Phase 8C closes the remaining gap — the Redis consumer and dashboard have not yet been updated to store or display the 8B dynamic fields or `trip_state`.
+
+**Outstanding items entering Phase 8C:**
+
+| Layer | Fields missing |
+|-------|---------------|
+| Redis consumer (`state_consumer.py`) | `trip_state`, `route_progress`, `estimated_arrival_minutes`, `remaining_stops`, `driver_hours_remaining` |
+| Dashboard (`dashboard/app.py`) | `trip_state`, `route_progress`, `estimated_arrival_minutes` |
+
+Static trip fields (`trip_id`, `cargo_type`, `cargo_value`, `customer_priority`, `service_level`, `destination_region`) are already stored in Redis and visible in the dashboard from Phase 8A work.
+
+### Key Decisions Made
+
+**No new components, no risk logic changes**
+Phase 8C is purely a schema propagation pass. The delivery-buffer and temperature thresholds, the IN_TRANSIT filter, and the `write_on_transition` deduplication logic are all unchanged. The only work is extending the field lists in `state_consumer.py` and `dashboard/app.py`.
+
+**`trip_state` must be stored in Redis**
+`risk-alerts` already carries `trip_state` (it is emitted by the simulator and propagated through Spark). The Redis consumer is not storing it yet. Adding it unlocks the dashboard ability to show whether a truck is currently `IN_TRANSIT` vs some other state, which is meaningful context for an operator looking at an active alert.
+
+**Dashboard minimum: trip_state, cargo_type, customer_priority, route_progress, estimated_arrival_minutes**
+These five fields give an operator the most immediate operational context at a glance: is the truck moving, what is it carrying, how important is the customer, how far along is the route, and when is it expected to arrive. Full dynamic field display (remaining_stops, driver_hours_remaining) can be surfaced in the per-truck JSON lookup without adding clutter to the fleet table.
