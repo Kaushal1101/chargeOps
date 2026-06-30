@@ -225,6 +225,7 @@ def run():
             )
         )
         .alias("reason"),
+        lit("IN_TRANSIT").alias("trip_state"),
         col("trip_id"),
         col("cargo_type"),
         col("cargo_value"),

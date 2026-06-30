@@ -23,6 +23,9 @@ TRUCK_COLUMNS = [
     "tier",
     "cargo_type",
     "customer_priority",
+    "trip_state",
+    "route_progress",
+    "estimated_arrival_minutes",
     "delivery_buffer",
     "avg_temperature",
     "reason",
@@ -87,11 +90,20 @@ col_yellow.metric("YELLOW Alerts", yellow_count)
 # --- Section 3: Active Trucks ---
 st.header("Active Trucks")
 
+def _fmt_route_progress(value: str) -> str:
+    try:
+        return f"{float(value) * 100:.0f}%"
+    except (ValueError, TypeError):
+        return value
+
+
 trucks: list[dict[str, str]] = []
 for key in r.scan_iter("truck:*"):
     record = r.hgetall(key)
     if record:
-        trucks.append({col: record.get(col, "") for col in TRUCK_COLUMNS})
+        row = {col: record.get(col, "") for col in TRUCK_COLUMNS}
+        row["route_progress"] = _fmt_route_progress(row["route_progress"])
+        trucks.append(row)
 
 if not trucks:
     st.write("No active alerts.")

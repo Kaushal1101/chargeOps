@@ -1083,32 +1083,36 @@ The telemetry stream now carries realistic, time-varying operational context on 
 
 ---
 
-## 2026-06-30 — Phase 8C Pre-Work: Schema Propagation Plan
+## 2026-06-30 — Phase 8C: Schema Propagation
 
 ### What Was Completed
 
-- `docs/phases/phase_8/phase_8c.md` — full Phase 8C plan written: scope, fields to propagate, Spark/Redis/dashboard change specifications, validation checklist, and exit criteria
+- `spark_streaming/stream_processor.py` — `lit("IN_TRANSIT").alias("trip_state")` added to `alert_records` select so `trip_state` appears in every `risk-alerts` message
+- `redis_consumer/state_consumer.py` — five new fields added to `truck:{vehicle_id}` hash: `trip_state`, `route_progress`, `estimated_arrival_minutes`, `remaining_stops`, `driver_hours_remaining`
+- `dashboard/app.py` — `TRUCK_COLUMNS` extended with `trip_state`, `route_progress`, `estimated_arrival_minutes`; `route_progress` formatted as a percentage string (e.g. `"43%"`) via `_fmt_route_progress()`
+- `docs/phases/phase_8/phase_8c.md` — plan doc written; `route_id` removed from field list (field does not exist in the simulator schema)
 
-### What Phase 8C Addresses
+### Bug Fixed: `trip_state` Missing from `risk-alerts` Payload
 
-Phases 8A and 8B completed all Spark-side work: the telemetry schema is fully expanded, the IN_TRANSIT filter is in place, and all enriched fields (static trip context + dynamic operational fields) flow through Spark into `risk-alerts`. Phase 8C closes the remaining gap — the Redis consumer and dashboard have not yet been updated to store or display the 8B dynamic fields or `trip_state`.
+`trip_state` was parsed from Kafka and used as the IN_TRANSIT filter (`col("trip_state") == "IN_TRANSIT"`), but was never added to the windowed aggregation or the `alert_records` select. It was silently absent from every `risk-alerts` message. The Redis consumer stored an empty string and the dashboard column showed nothing.
 
-**Outstanding items entering Phase 8C:**
+Since all alerts by definition originate from IN_TRANSIT events (the filter guarantees this), `lit("IN_TRANSIT")` is the correct and simplest fix — no aggregation change required.
 
-| Layer | Fields missing |
-|-------|---------------|
-| Redis consumer (`state_consumer.py`) | `trip_state`, `route_progress`, `estimated_arrival_minutes`, `remaining_stops`, `driver_hours_remaining` |
-| Dashboard (`dashboard/app.py`) | `trip_state`, `route_progress`, `estimated_arrival_minutes` |
+### Key Design Decisions
 
-Static trip fields (`trip_id`, `cargo_type`, `cargo_value`, `customer_priority`, `service_level`, `destination_region`) are already stored in Redis and visible in the dashboard from Phase 8A work.
+**`lit("IN_TRANSIT")` over `first(col("trip_state"))` in aggregation**
+Adding `first(col("trip_state"))` would have required an aggregation change and a schema change in the windowed agg. Since the IN_TRANSIT filter upstream guarantees the value is always `"IN_TRANSIT"`, `lit("IN_TRANSIT")` in the `alert_records` select is equivalent, simpler, and requires no upstream changes.
 
-### Key Decisions Made
+**`route_progress` displayed as percentage, stored as float**
+Redis stores the raw float (`"0.4321"`) so downstream consumers retain full precision. The dashboard formats it to `"43%"` at display time via `_fmt_route_progress()`. The conversion is isolated to the display layer and does not affect any other consumer.
 
-**No new components, no risk logic changes**
-Phase 8C is purely a schema propagation pass. The delivery-buffer and temperature thresholds, the IN_TRANSIT filter, and the `write_on_transition` deduplication logic are all unchanged. The only work is extending the field lists in `state_consumer.py` and `dashboard/app.py`.
+**`remaining_stops` and `driver_hours_remaining` in Redis but not dashboard table**
+Both fields are stored in Redis and visible in the per-truck JSON lookup (Section 4 of the dashboard). They are not added to `TRUCK_COLUMNS` to keep the active truck table readable — the five columns already added (`trip_state`, `route_progress`, `estimated_arrival_minutes`, plus the existing `cargo_type`, `customer_priority`) give operators the most actionable at-a-glance context.
 
-**`trip_state` must be stored in Redis**
-`risk-alerts` already carries `trip_state` (it is emitted by the simulator and propagated through Spark). The Redis consumer is not storing it yet. Adding it unlocks the dashboard ability to show whether a truck is currently `IN_TRANSIT` vs some other state, which is meaningful context for an operator looking at an active alert.
+### Phase 8C Complete
 
-**Dashboard minimum: trip_state, cargo_type, customer_priority, route_progress, estimated_arrival_minutes**
-These five fields give an operator the most immediate operational context at a glance: is the truck moving, what is it carrying, how important is the customer, how far along is the route, and when is it expected to arrive. Full dynamic field display (remaining_stops, driver_hours_remaining) can be surfaced in the per-truck JSON lookup without adding clutter to the fleet table.
+The enriched trip schema now flows end-to-end through the full pipeline:
+
+**Simulator → Kafka → Spark → `risk-alerts` → Redis → Dashboard**
+
+Every layer — Spark output, Redis hash, and dashboard table — carries `trip_state`, route progress, and arrival estimates alongside the existing risk fields. The pipeline now represents a realistic logistics lifecycle observable from telemetry through to the operations dashboard without any change to the underlying risk detection logic.
