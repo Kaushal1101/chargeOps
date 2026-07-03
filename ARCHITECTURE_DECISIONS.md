@@ -127,6 +127,111 @@ The **LogiShield Pipeline** is a real-time logistics risk detection system that 
 
 ---
 
+### Decision 11: Threaded Simulator with Fleet Sharding (Phase 5A)
+
+**Context:** The sequential simulator loop bottlenecked at ~2,000 events/sec in Phase 4D — Python's GIL and single-threaded iteration over the fleet was the ceiling, not Kafka or Spark.
+
+**The Decision:** Replace the single loop with 4 worker threads, each owning a deterministic round-robin shard of the fleet (`vehicles[i::4]`). A single shared `KafkaProducer` is used across all threads. A `threading.Event` stop flag replaces `time.sleep()` in worker loops so threads wake immediately on shutdown.
+
+**Justification:** Kafka sends are I/O-bound, not CPU-bound — threads help despite the GIL because each thread spends most of its time waiting on the producer's internal buffer, not computing. One producer per process is correct: `kafka-python-ng`'s `KafkaProducer` is thread-safe and batches more efficiently with a single shared buffer than with one producer per thread. `stop.wait(timeout)` instead of `time.sleep()` is critical for responsive shutdown — without it, Ctrl+C leaves threads sleeping for up to 1 second before they can exit.
+
+**Result:** Standalone Python ceiling increased from ~2,000 ev/s to ~10,500 ev/s (5x improvement).
+
+---
+
+### Decision 12: Kafka Producer Tuning — Batching, Buffer, and LZ4 Compression (Phase 5B)
+
+**Context:** After threading, the full pipeline (Python + Kafka + Spark) plateaued at ~3,000 ev/s. Python diagnostic and Spark input rate were at the same ceiling, meaning Kafka back-pressure was throttling the producer down to Spark's speed. The default `linger_ms=0` was causing ~10,000 individual produce requests per second to the broker.
+
+**The Decision:** Set `linger_ms=10`, `batch_size=65536`, `buffer_memory=67108864`, and `compression_type="lz4"` on the shared producer.
+
+**Justification:**
+- `linger_ms=10` allows messages to accumulate for 10ms before sending, reducing broker request count by ~100x at high throughput
+- `batch_size=65536` (64KB) allows larger batches to form, amortising per-request overhead
+- `buffer_memory=67108864` (64MB, doubled from default) reduces the frequency of back-pressure blocking under load
+- `lz4` chosen over `snappy` — both are fast low-overhead compressors; lz4 installed cleanly via pip while snappy's native dependency failed to download. JSON telemetry payloads compress well (~291 bytes → ~150 bytes), reducing broker I/O
+
+**Result:** Python diagnostic under full pipeline load increased from ~3,000 ev/s to ~7,700 ev/s. Spark input rate increased from ~2,500 to ~3,300 ev/s.
+
+---
+
+### Decision 13: Topic Partition Count Increased from 3 to 12 (Phase 5B)
+
+**Context:** `fleet-telemetry` and `risk-alerts` were created with 3 partitions — designed for the original 3-truck fleet. At 10,000+ trucks with 4 producer threads, all traffic was funnelled through 3 partitions, creating per-partition contention at the broker.
+
+**The Decision:** Increase both topics to 12 partitions. `docker-compose.yml` kafka-init updated to create topics at 12 partitions on fresh stack startup.
+
+**Justification:** 12 is divisible by 4 (producer threads), allowing each thread to target a distinct set of partitions. It also provides more parallel read tasks for Spark's `local[*]` executor. Topics were deleted and recreated (rather than altered in place) to purge accumulated messages from earlier test runs which were causing Spark to fall behind on a large backlog.
+
+**Result:** Partition increase did not materially improve Spark input rate (~2,700 ev/s) — confirming the bottleneck had moved from Kafka to Spark's processing capacity, not partition contention. The decision is still correct: 3 partitions was under-provisioned for the current scale and would have become a bottleneck at higher Spark throughput.
+
+---
+
+### Decision 14: TTL-Based GREEN State Recovery for Redis Fleet State (Phase 7)
+
+**Context:** The `risk-alerts` Kafka topic only receives YELLOW and RED transitions. GREEN is filtered out in Spark before reaching Kafka (`alerts = tiered.filter(col("risk_tier") != "GREEN")`). A Redis state consumer reading only `risk-alerts` has no signal for when a truck returns to GREEN. Without handling this, a truck that was RED and recovers will remain RED in Redis indefinitely, and `fleet:counts` will accumulate inflated YELLOW/RED counts over time.
+
+**Options considered:**
+1. Emit GREEN transitions to `risk-alerts` — modifying the Spark pipeline so the topic becomes a full state-change stream
+2. TTL-based expiry on `truck:{vehicle_id}` keys in Redis
+3. A separate reconciliation process that periodically recomputes state from Kafka history
+
+**The Decision:** Use TTL-based key expiry on `truck:{vehicle_id}` Redis keys. TTL is set to `window_duration + watermark + safety_buffer = 5 min + 1 min + 1 min = 7 minutes`. If a truck returns to GREEN, no further alerts are emitted and the key expires naturally after ~7 minutes.
+
+**Justification:** Emitting GREEN transitions is the most complete solution but changes the semantics of `risk-alerts` from an alert-only stream to a full state-change stream — a significant architectural shift. The TTL approach requires zero changes to the existing pipeline, is simple to reason about, and provides an acceptable approximation: Redis reflects *active non-GREEN alert state*, not complete fleet state. The 7-minute expiry window is long enough that a truck actively in YELLOW or RED will be refreshed well before expiry (alerts fire on tier changes; a sustained risk state will produce at least one alert per window close, every ~66 seconds), and short enough that recovered trucks are purged within one observation window.
+
+**Explicit limitation:** Redis materializes active non-GREEN alert state, not the complete fleet state. A truck absent from Redis has either never generated an alert, or returned to GREEN and had its key expire. `fleet:counts` reflects trucks with active YELLOW/RED alerts only, not total fleet size.
+
+**Future enhancement path:** Emit GREEN state transitions as a distinct event type in `risk-alerts` (or a dedicated topic) to support full fleet-state materialization without expiration-based cleanup. This would allow Redis to hold the definitive current tier for every vehicle regardless of recovery timing, and is the correct approach before any production dashboard is built.
+
+---
+
+### Decision 15: Redis as the Operational State Layer (Phase 7)
+
+**Context:** After Phase 6, LogiShield could detect risk in real time and benchmark throughput, but had no way to answer "what is the current state of the fleet?" without replaying Kafka history. The risk alert stream is event-based — it records when risk changes, not what the current state is. A dashboard or operations interface needs a fast, queryable snapshot of current state.
+
+**Options considered:**
+1. Query Kafka directly — replay `risk-alerts` from offset 0 to reconstruct current state on every request
+2. Write per-truck state to PostgreSQL after each alert
+3. Write per-truck state to Redis after each alert
+
+**The Decision:** Redis as a materialized view of active fleet state, populated by a lightweight consumer reading from `risk-alerts`.
+
+**Justification:**
+- **Kafka is the wrong tool for state queries.** Replaying the event log to answer a current-state question defeats the purpose of streaming — it trades a O(1) lookup for O(n) replay. Kafka is the source of truth for *what happened*; it should not be the query layer for *what is true now*.
+- **PostgreSQL adds unnecessary complexity.** A relational database is the right choice when you need joins, history, or complex queries. The current-state use case is purely key-value: given a vehicle ID, return its latest alert fields. PostgreSQL's schema management, connection pooling, and write overhead are not justified here.
+- **Redis maps naturally to the data model.** One Redis Hash per truck (`truck:{vehicle_id}`) maps directly to the alert payload. Lookups are O(1) by key. Fleet-wide counts fit in a single Hash (`fleet:counts`). The entire operational state layer can be expressed in three key patterns.
+- **TTL is a native Redis feature.** The GREEN recovery problem — Spark does not emit GREEN transitions, so stale YELLOW/RED keys would accumulate — is solved by Redis key expiry without any pipeline changes. See Decision 14.
+- **The three layers are complementary with no overlap.** Kafka owns event history. Spark owns stream processing and risk detection. Redis owns current operational state. Each answers a different class of question; none duplicates another.
+
+**Result:** A downstream Redis consumer (`redis_consumer/state_consumer.py`) reads `risk-alerts` and materializes per-truck state with a 7-minute TTL. A Streamlit dashboard (`dashboard/app.py`) reads exclusively from Redis and visualizes fleet health, active alerts, and per-truck state — completing the end-to-end operational flow without touching the existing pipeline.
+
+---
+
+### Decision 16: IN_TRANSIT Filter Before Windowed Aggregation (Phase 8A)
+
+**Context:** Phase 8A introduced a four-state truck lifecycle (IDLE, LOADING, IN_TRANSIT, DELIVERY_COMPLETE). All states emit telemetry events to `fleet-telemetry`. Without filtering, Spark's windowed aggregation would include events from idle and loading trucks — producing delivery buffer and temperature readings of 0.0 that could trigger spurious YELLOW or RED alerts for trucks not on an active delivery leg.
+
+**The Decision:** Filter to `trip_state == IN_TRANSIT` in Spark before the `.withWatermark()` call, so only in-transit events enter the windowed aggregation path.
+
+**Justification:** The filter must happen before watermarking and windowing, not after. Filtering after aggregation would still waste compute aggregating meaningless sensor values and could produce misleading window averages that mix real delivery telemetry with idle placeholder values (0.0). Filtering before aggregation ensures the risk computation only ever sees operationally meaningful data. This also keeps the risk logic itself unchanged — the thresholds, tier classification, and transition detection are all unmodified; the only change is which events are fed into the computation.
+
+**Consequence:** A truck that transitions from IN_TRANSIT to IDLE mid-window will have its remaining events excluded from that window. This is the correct behavior — a truck that has completed its delivery should not continue contributing to an active risk window.
+
+---
+
+### Decision 17: Transition Detection Keyed on (vehicle_id, trip_id) (Phase 8B)
+
+**Context:** `write_on_transition` in Spark suppresses duplicate alerts by tracking the last emitted tier per truck in a `last_tiers` dict. Originally keyed on `vehicle_id` alone. With the Phase 8A trip lifecycle, trucks complete trips, go idle, and start new trips. If a truck's second trip produces the same risk tier as its first, `write_on_transition` sees no change and silently drops the alert — leaving Redis and the dashboard stale until Spark restarts.
+
+**The Decision:** Key `last_tiers` on `(vehicle_id, trip_id)` instead of `vehicle_id`.
+
+**Justification:** Each `trip_id` is a UUID assigned at trip start. Using it as part of the transition key means every new trip is treated as a fresh alert context regardless of prior tier history. The fix is a one-line change with no impact on the deduplication behavior within a single trip.
+
+**Observed failure:** Confirmed in Phase 8B testing — trucks re-entering IN_TRANSIT on their second trip generated no Redis updates and the dashboard remained empty until Spark was restarted.
+
+---
+
 ### Known Issue 1: YELLOW Alerts Eclipsed by RED in Long-Running Windows
 
 **Observed:** During Phase 3E validation, only RED alerts appeared in `risk-alerts`. No YELLOW alerts were produced despite the simulator cycling through YELLOW states.

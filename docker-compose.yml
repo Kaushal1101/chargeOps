@@ -47,8 +47,8 @@ services:
     command: >
       bash -c "
       echo 'Creating Kafka topics...' &&
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic fleet-telemetry --partitions 3 --replication-factor 1 &&
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic risk-alerts --partitions 3 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic fleet-telemetry --partitions 12 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic risk-alerts --partitions 12 --replication-factor 1 &&
       echo 'Topics created successfully.' &&
       kafka-topics --bootstrap-server kafka:9092 --list
       "
@@ -77,6 +77,18 @@ services:
       SPARK_NO_DAEMONIZE: "true"
     depends_on:
       - spark-master
+
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
