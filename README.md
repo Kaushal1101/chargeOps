@@ -1,113 +1,113 @@
-# 🚚 LogiShield Pipeline
+# LogiShield — Real-Time EV Charging Network Operations
 
-A real-time logistics risk detection platform designed to ingest fleet telemetry, identify emerging operational risks, and generate AI-powered remediation recommendations through a distributed event-driven architecture.
+A real-time infrastructure operations platform that monitors the health and availability of a distributed EV charging network. The system ingests continuous telemetry from simulated charging stations across Singapore, processes the stream with Apache Spark, classifies charger health in real time, and surfaces operational alerts through a Redis-backed dashboard.
 
-## 🏗️ Architecture & Tech Stack
-
-This project uses a streaming-first architecture that separates telemetry generation, real-time analytics, and intelligent incident response into independent components:
-
-- Telemetry Simulation (Python): Fleet simulators in the /simulator directory generate realistic truck telemetry streams including delivery timelines, cargo temperature readings, and operational anomalies.
-
-- Message Broker (Apache Kafka): Kafka serves as the central event bus, decoupling telemetry producers from downstream processing services.
-
-- Stream Processing (Apache Spark Structured Streaming): PySpark jobs continuously consume telemetry events, perform event-time aggregations, calculate rolling metrics, and classify operational risk levels.
-
-- Risk Tiering Engine: A deterministic rules engine evaluates delivery buffer degradation and cargo health to assign Green, Yellow, or Red risk classifications.
-
-- AI Remediation Agent: Alert consumers transform high-risk operational events into concise business-impact assessments and recommended mitigation actions using a configurable LLM integration.
-
-- Fault Tolerance Testing: Chaos engineering utilities inject packet loss, network delays, and throughput spikes to validate pipeline resilience under adverse conditions.
-
-## 🔄 System Flow
+## Architecture
 
 ```text
-Telemetry Simulator
+Charger Simulator (Singapore charging network digital twin)
         │
         ▼
-Apache Kafka (fleet-telemetry)
+Apache Kafka (charger-telemetry)
         │
         ▼
-Spark Structured Streaming
-        │
-        ▼
-Risk Tiering Engine (Green / Yellow / Red)
+Spark Structured Streaming (session-scoped windowed risk classification)
         │
         ▼
 Apache Kafka (risk-alerts)
         │
         ▼
-AI Remediation Agent
+Redis (per-charger operational state)
         │
         ▼
-Operational Briefs
+Streamlit Dashboard (network operations console)
 ```
+
+## What It Does
+
+Each simulated charger cycles through a realistic session lifecycle: `AVAILABLE → INITIALIZING → CHARGING → SESSION_COMPLETE`. During active charging sessions, Spark continuously evaluates two risk signals:
+
+- **Charger temperature** — whether the hardware is approaching or exceeding its thermal threshold
+- **Session buffer** — whether the session is projected to complete within its scheduled window
+
+Chargers are classified GREEN, YELLOW, or RED on a rolling 5-minute sliding window. Only YELLOW and RED transitions produce alerts, avoiding alert storms from sustained conditions. Alert state is materialized into Redis and displayed on the operations dashboard in real time.
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Simulation | Python, Pydantic |
+| Message broker | Apache Kafka |
+| Stream processing | Apache Spark Structured Streaming, PySpark |
+| Operational state | Redis |
+| Dashboard | Streamlit |
+| Infrastructure | Docker Compose |
+
+## Distributed Systems Properties
+
+- **Event-time processing** — Spark windows on `event_ts` (when the event occurred), not ingestion time
+- **Watermarking** — late-arriving events handled gracefully without corrupting stream state
+- **Sliding windows** — 5-minute windows with 30-second slide intervals for continuous trend detection
+- **Stateful deduplication** — alerts only fire on tier transitions, not on every window evaluation
+- **TTL-based eviction** — charger state expires from Redis after inactivity, keeping the dashboard current
+
+## Charger Network
+
+The simulator models a network of EV charging stations distributed across Singapore, each with a fixed geographic location:
+
+| Site | Region | Connector types |
+|---|---|---|
+| Orchard Central | Central | CCS2, HPC |
+| Raffles Place | Central | CHAdeMO |
+| Bishan MRT | Central | Type2 |
+| Changi Airport | East | HPC |
+| Tampines Hub | East | CCS2 |
+| Woodlands Civic | North | CCS2 |
+| Yishun Mall | North | Type2 |
+| Jurong East | West | CCS2 |
+| Buona Vista | West | CHAdeMO |
+| HarbourFront | South | Type2 |
+
+Each charger carries `charger_lat` and `charger_lng` coordinates in every telemetry event, enabling future geographic visualisation without pipeline changes.
 
 ## Prerequisites
 
-- Docker Desktop — runs Kafka, Zookeeper, and supporting infrastructure
+- Docker Desktop — runs Kafka, Zookeeper, Redis, and Spark
 - Python 3.12
 - Java 11 or higher — required by PySpark
 
-## ⚡ Core Capabilities
+## Running the Pipeline
 
-### Real-Time Fleet Monitoring
-Continuously processes streaming telemetry from simulated logistics fleets to detect delivery delays and cargo condition violations before SLA breaches occur.
+```bash
+# 1. Start infrastructure
+docker-compose up -d
 
-### Event-Time Analytics
-Uses Spark Structured Streaming with sliding windows and watermarking to maintain accurate calculations even when telemetry packets arrive late or out of order.
+# 2. Start Spark (clear checkpoint on first run or after schema changes)
+rm -rf /tmp/logishield-checkpoints/risk-alerts
+spark-submit \
+  --master 'local[*]' \
+  --packages 'org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1' \
+  spark_streaming/stream_processor.py
 
-### Risk Classification
-Evaluates operational health using rolling delivery buffers and cargo temperature trends to proactively identify at-risk shipments.
+# 3. Start the charger simulator
+python -m simulator.simulator --network-size 10
 
-### AI-Powered Incident Response
-Automatically translates technical anomaly signals into concise operational recommendations and business-impact summaries.
+# 4. Start the Redis state consumer
+python -m redis_consumer.state_consumer --verbose
 
-### Chaos Engineering Validation
-Stress-tests the platform against network degradation, packet loss, and throughput spikes to verify reliability under real-world failure scenarios.
+# 5. Start the dashboard
+streamlit run dashboard/app.py
+```
 
-## 🛠️ Technology Stack
-
-### Data Streaming
-- Apache Kafka
-- Apache Zookeeper
-
-### Stream Processing
-- Apache Spark Structured Streaming
-- PySpark
-
-### AI Layer
-- Python
-- Configurable LLM integration
-
-### Infrastructure
-- Docker Compose
-
-### Data Format
-- JSON Event Streams
-
-## 📂 Repository Structure
+## Repository Structure
 
 ```text
-logishield-pipeline/
-
-├── simulator/
-│   └── Fleet telemetry generation
-│
-├── spark_streaming/
-│   └── Stream processing and risk tiering
-│
-├── agent/
-│   └── AI remediation workflows
-│
-├── chaos/
-│   └── Fault injection and resilience testing
-│
-├── benchmarks/
-│   └── Performance measurement utilities
-│
-├── configs/
-│   └── Shared configuration
-│
-└── docs/
-    └── Architecture and design documentation
+├── simulator/          Charger network digital twin and session lifecycle simulation
+├── spark_streaming/    Spark Structured Streaming risk classification pipeline
+├── redis_consumer/     Kafka consumer that materializes alert state into Redis
+├── dashboard/          Streamlit network operations console
+├── benchmarks/         Throughput and latency measurement suite
+├── chaos/              Fault injection utilities (out-of-order events, delayed bursts)
+├── configs/            Shared configuration
+└── docs/               Architecture, schema, and phase planning documentation
 ```

@@ -47,7 +47,7 @@ services:
     command: >
       bash -c "
       echo 'Creating Kafka topics...' &&
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic fleet-telemetry --partitions 12 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic charger-telemetry --partitions 12 --replication-factor 1 &&
       kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic risk-alerts --partitions 12 --replication-factor 1 &&
       echo 'Topics created successfully.' &&
       kafka-topics --bootstrap-server kafka:9092 --list

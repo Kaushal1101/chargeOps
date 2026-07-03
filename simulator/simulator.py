@@ -13,18 +13,34 @@ from kafka.errors import KafkaError
 
 from simulator.models import TelemetryEvent
 
-TOPIC = "fleet-telemetry"
+TOPIC = "charger-telemetry"
 
-_CARGO_TYPES = [
-    "Pharmaceuticals",
-    "Fresh Food",
-    "Frozen Goods",
-    "Electronics",
-    "General Freight",
+_CONNECTOR_TYPES = ["CCS2", "CHAdeMO", "Type2", "HPC"]
+_USER_TIERS = ["Standard", "Priority", "Corporate"]
+_CHARGING_SPEEDS = ["Standard", "Fast", "Ultra-Fast"]
+_SITE_REGIONS = ["North", "South", "East", "West", "Central"]
+
+_SITES = [
+    ("Orchard_Central",  "Central", 1.3048, 103.8318),
+    ("Raffles_Place",    "Central", 1.2830, 103.8513),
+    ("Bishan_MRT",       "Central", 1.3526, 103.8352),
+    ("Changi_Airport",   "East",    1.3644, 103.9915),
+    ("Tampines_Hub",     "East",    1.3496, 103.9568),
+    ("Woodlands_Civic",  "North",   1.4382, 103.7890),
+    ("Yishun_Mall",      "North",   1.4304, 103.8354),
+    ("Jurong_East",      "West",    1.3329, 103.7436),
+    ("Buona_Vista",      "West",    1.3067, 103.7904),
+    ("HarbourFront",     "South",   1.2654, 103.8200),
 ]
-_CUSTOMER_PRIORITIES = ["Standard", "Priority", "Critical"]
-_SERVICE_LEVELS = ["Standard", "Express", "Same-Day"]
-_DESTINATION_REGIONS = ["North", "South", "East", "West"]
+
+
+def _rated_power(connector_type: str) -> float:
+    return {
+        "Type2":   round(random.uniform(7.0, 22.0), 1),
+        "CCS2":    round(random.uniform(50.0, 150.0), 1),
+        "CHAdeMO": round(random.uniform(50.0, 100.0), 1),
+        "HPC":     round(random.uniform(150.0, 350.0), 1),
+    }[connector_type]
 
 
 class Scenario:
@@ -40,121 +56,124 @@ class Scenario:
             return cls("YELLOW")
         return cls("RED")
 
-    def generate_values(self, temp_threshold: float, sla_threshold: int) -> dict:
+    def generate_values(self, temp_threshold: float, session_buffer_threshold: int) -> dict:
         if self.state == "GREEN":
-            cargo_temperature = random.uniform(temp_threshold - 3.0, temp_threshold - 1.0)
-            time_left_to_destination = random.randint(10, 30)
-            sla_time_remaining = time_left_to_destination + sla_threshold + random.randint(10, 30)
+            charger_temperature = temp_threshold - random.uniform(5, 15)
+            estimated_completion_minutes = random.randint(5, 30)
+            session_time_remaining = (
+                estimated_completion_minutes + session_buffer_threshold + random.randint(10, 30)
+            )
         elif self.state == "YELLOW":
-            cargo_temperature = random.uniform(temp_threshold * 0.9, temp_threshold * 0.95)
-            time_left_to_destination = random.randint(10, 30)
-            sla_time_remaining = time_left_to_destination + random.randint(0, sla_threshold)
+            charger_temperature = temp_threshold * random.uniform(0.90, 0.95)
+            estimated_completion_minutes = random.randint(5, 30)
+            session_time_remaining = (
+                estimated_completion_minutes + random.randint(0, session_buffer_threshold)
+            )
         else:  # RED
-            cargo_temperature = random.uniform(temp_threshold + 0.5, temp_threshold + 3.0)
-            time_left_to_destination = random.randint(10, 30)
-            sla_time_remaining = time_left_to_destination - random.randint(1, 20)
+            charger_temperature = temp_threshold + random.uniform(2, 10)
+            estimated_completion_minutes = random.randint(5, 30)
+            session_time_remaining = estimated_completion_minutes - random.randint(1, 20)
 
         return {
-            "cargo_temperature": round(cargo_temperature, 2),
-            "time_left_to_destination": time_left_to_destination,
-            "sla_time_remaining": sla_time_remaining,
+            "charger_temperature": round(charger_temperature, 2),
+            "estimated_completion_minutes": estimated_completion_minutes,
+            "session_time_remaining": session_time_remaining,
         }
 
 
 @dataclass
-class TripContext:
-    trip_id: str
-    cargo_type: str
-    cargo_value: float
-    customer_priority: str
-    service_level: str
-    destination_region: str
-    remaining_stops_initial: int
-    shift_hours: float
-    trip_start_time: float
+class SessionContext:
+    session_id: str
+    connector_type: str
+    energy_requested_kwh: float
+    user_tier: str
+    charging_speed: str
+    session_start_time: float
 
     @classmethod
-    def generate(cls) -> "TripContext":
+    def generate(cls) -> "SessionContext":
         return cls(
-            trip_id=str(uuid.uuid4()),
-            cargo_type=random.choice(_CARGO_TYPES),
-            cargo_value=round(random.uniform(5000.0, 500000.0), 2),
-            customer_priority=random.choice(_CUSTOMER_PRIORITIES),
-            service_level=random.choice(_SERVICE_LEVELS),
-            destination_region=random.choice(_DESTINATION_REGIONS),
-            remaining_stops_initial=max(1, random.randint(1, 5)),
-            shift_hours=round(random.uniform(8.0, 11.0), 4),
-            trip_start_time=0.0,
+            session_id=str(uuid.uuid4()),
+            connector_type=random.choice(_CONNECTOR_TYPES),
+            energy_requested_kwh=round(random.uniform(10.0, 80.0), 2),
+            user_tier=random.choice(_USER_TIERS),
+            charging_speed=random.choice(_CHARGING_SPEEDS),
+            session_start_time=0.0,
         )
 
 
-class Vehicle:
+class Charger:
     def __init__(
         self,
-        vehicle_id: str,
-        cargo_temp_threshold: float,
-        sla_buffer_threshold: int,
+        charger_id: str,
+        temp_threshold: float,
+        session_buffer_threshold: int,
+        charger_lat: float,
+        charger_lng: float,
+        rated_power_kw: float,
+        site_id: str,
+        site_region: str,
         interval_seconds: float = 1.0,
     ) -> None:
-        self.vehicle_id = vehicle_id
-        self.cargo_temp_threshold = cargo_temp_threshold
-        self.sla_buffer_threshold = sla_buffer_threshold
+        self.charger_id = charger_id
+        self.temp_threshold = temp_threshold
+        self.session_buffer_threshold = session_buffer_threshold
+        self.charger_lat = charger_lat
+        self.charger_lng = charger_lng
+        self.rated_power_kw = rated_power_kw
+        self.site_id = site_id
+        self.site_region = site_region
         self.interval_seconds = interval_seconds
         self._step: int = 0
-        self.trip_state: str = "IDLE"
+        self.session_state: str = "AVAILABLE"
         self._state_deadline: float = time.time() + random.uniform(30, 90)
-        self._trip_context: TripContext | None = None
+        self._session_context: SessionContext | None = None
 
     def _maybe_advance_lifecycle(self) -> None:
         now = time.time()
         if now < self._state_deadline:
             return
-        if self.trip_state == "IDLE":
-            self.trip_state = "LOADING"
-            self._trip_context = TripContext.generate()
+        if self.session_state == "AVAILABLE":
+            self.session_state = "INITIALIZING"
+            self._session_context = SessionContext.generate()
             self._state_deadline = now + random.uniform(60, 180)
-        elif self.trip_state == "LOADING":
-            self.trip_state = "IN_TRANSIT"
-            self._trip_context.trip_start_time = now
+        elif self.session_state == "INITIALIZING":
+            self.session_state = "CHARGING"
+            self._session_context.session_start_time = now
             self._state_deadline = now + random.uniform(300, 900)
-        elif self.trip_state == "IN_TRANSIT":
-            self.trip_state = "DELIVERY_COMPLETE"
+        elif self.session_state == "CHARGING":
+            self.session_state = "SESSION_COMPLETE"
             self._state_deadline = now
-        elif self.trip_state == "DELIVERY_COMPLETE":
-            self.trip_state = "IDLE"
-            self._trip_context = None
+        elif self.session_state == "SESSION_COMPLETE":
+            self.session_state = "AVAILABLE"
+            self._session_context = None
             self._state_deadline = now + random.uniform(30, 90)
 
     def _compute_dynamic_fields(self) -> dict:
-        if self.trip_state != "IN_TRANSIT" or self._trip_context is None:
+        if self.session_state != "CHARGING" or self._session_context is None:
             return {
-                "route_progress": 0.0,
-                "estimated_arrival_minutes": 0,
-                "remaining_stops": 0,
-                "driver_hours_remaining": 0.0,
+                "session_progress": 0.0,
+                "estimated_completion_minutes": 0,
+                "power_output_kw": 0.0,
+                "energy_delivered_kwh": 0.0,
             }
 
-        ctx = self._trip_context
-        elapsed = time.time() - ctx.trip_start_time
-        trip_duration = self._state_deadline - ctx.trip_start_time
-        trip_duration = max(trip_duration, 1.0)
+        ctx = self._session_context
+        elapsed = time.time() - ctx.session_start_time
+        trip_duration = max(self._state_deadline - ctx.session_start_time, 1.0)
 
-        route_progress = min(elapsed / trip_duration, 1.0)
-
-        trip_duration_minutes = trip_duration / 60.0
-        estimated_arrival_minutes = max(0, round((1.0 - route_progress) * trip_duration_minutes))
-
-        threshold_interval = 1.0 / ctx.remaining_stops_initial
-        stops_completed = int(route_progress / threshold_interval)
-        remaining_stops = max(0, ctx.remaining_stops_initial - stops_completed)
-
-        driver_hours_remaining = max(0.0, ctx.shift_hours - (elapsed / 3600.0))
+        session_progress = min(elapsed / trip_duration, 1.0)
+        estimated_completion_minutes = max(
+            0, round((1.0 - session_progress) * (trip_duration / 60.0))
+        )
+        power_output_kw = round(self.rated_power_kw * random.uniform(0.7, 1.0), 2)
+        energy_delivered_kwh = round(session_progress * ctx.energy_requested_kwh, 3)
 
         return {
-            "route_progress": round(route_progress, 4),
-            "estimated_arrival_minutes": estimated_arrival_minutes,
-            "remaining_stops": remaining_stops,
-            "driver_hours_remaining": round(driver_hours_remaining, 4),
+            "session_progress": round(session_progress, 4),
+            "estimated_completion_minutes": estimated_completion_minutes,
+            "power_output_kw": power_output_kw,
+            "energy_delivered_kwh": energy_delivered_kwh,
         }
 
     def current_scenario(self) -> Scenario:
@@ -164,70 +183,71 @@ class Vehicle:
         self._maybe_advance_lifecycle()
         dynamic = self._compute_dynamic_fields()
 
-        if self.trip_state == "IN_TRANSIT":
+        if self.session_state == "CHARGING":
             scenario = self.current_scenario()
             values = scenario.generate_values(
-                self.cargo_temp_threshold, self.sla_buffer_threshold
+                self.temp_threshold, self.session_buffer_threshold
             )
         else:
             scenario = None
             values = {
-                "cargo_temperature": 0.0,
-                "time_left_to_destination": 0,
-                "sla_time_remaining": 0,
+                "charger_temperature": 0.0,
+                "estimated_completion_minutes": 0,
+                "session_time_remaining": 0,
             }
 
         if event_ts is None:
             event_ts = datetime.now(timezone.utc)
         event_ts_str = event_ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
-        ctx = self._trip_context
+        ctx = self._session_context
         return TelemetryEvent(
             event_id=str(uuid.uuid4()),
             event_ts=event_ts_str,
-            vehicle_id=self.vehicle_id,
-            cargo_temperature=values["cargo_temperature"],
-            time_left_to_destination=values["time_left_to_destination"],
-            sla_time_remaining=values["sla_time_remaining"],
-            scenario_state=scenario.state if self.trip_state == "IN_TRANSIT" else "GREEN",
-            sla_buffer_threshold=self.sla_buffer_threshold,
-            cargo_temp_threshold=self.cargo_temp_threshold,
-            trip_state=self.trip_state,
-            trip_id=ctx.trip_id if ctx else "",
-            cargo_type=ctx.cargo_type if ctx else "",
-            cargo_value=ctx.cargo_value if ctx else 0.0,
-            customer_priority=ctx.customer_priority if ctx else "",
-            service_level=ctx.service_level if ctx else "",
-            destination_region=ctx.destination_region if ctx else "",
-            route_progress=dynamic["route_progress"],
-            estimated_arrival_minutes=dynamic["estimated_arrival_minutes"],
-            remaining_stops=dynamic["remaining_stops"],
-            driver_hours_remaining=dynamic["driver_hours_remaining"],
+            charger_id=self.charger_id,
+            charger_temperature=values["charger_temperature"],
+            estimated_completion_minutes=values["estimated_completion_minutes"],
+            session_time_remaining=values["session_time_remaining"],
+            scenario_state=scenario.state if self.session_state == "CHARGING" else "GREEN",
+            session_buffer_threshold=self.session_buffer_threshold,
+            temp_threshold=self.temp_threshold,
+            session_state=self.session_state,
+            session_id=ctx.session_id if ctx else "",
+            connector_type=ctx.connector_type if ctx else "",
+            energy_requested_kwh=ctx.energy_requested_kwh if ctx else 0.0,
+            user_tier=ctx.user_tier if ctx else "",
+            charging_speed=ctx.charging_speed if ctx else "",
+            site_region=self.site_region,
+            session_progress=dynamic["session_progress"],
+            power_output_kw=dynamic["power_output_kw"],
+            energy_delivered_kwh=dynamic["energy_delivered_kwh"],
+            charger_lat=self.charger_lat,
+            charger_lng=self.charger_lng,
+            rated_power_kw=self.rated_power_kw,
+            site_id=self.site_id,
         )
 
     def advance(self) -> None:
         self._step += 1
 
-    def __lt__(self, other: "Vehicle") -> bool:
-        return self.vehicle_id < other.vehicle_id
+    def __lt__(self, other: "Charger") -> bool:
+        return self.charger_id < other.charger_id
 
 
-class Fleet:
-    def __init__(self, vehicles: list[Vehicle]) -> None:
-        self.vehicles = vehicles
-
-    @classmethod
-    def default(cls) -> "Fleet":
-        return cls(
-            [
-                Vehicle("TRUCK_101", 5.0, 30),
-                Vehicle("TRUCK_102", 6.0, 25),
-                Vehicle("TRUCK_103", 4.5, 35),
-            ]
-        )
+class Network:
+    def __init__(self, chargers: list[Charger]) -> None:
+        self.chargers = chargers
 
     @classmethod
-    def scaled(cls, n: int) -> "Fleet":
+    def default(cls) -> "Network":
+        return cls([
+            Charger("SG-ORC-01", 50.0, 10, 1.3048, 103.8318, 150.0, "Orchard_Central", "Central"),
+            Charger("SG-CBD-01", 45.0, 10, 1.2830, 103.8513,  50.0, "Raffles_Place",   "Central"),
+            Charger("SG-CHG-01", 55.0, 10, 1.3644, 103.9915, 350.0, "Changi_Airport",  "East"),
+        ])
+
+    @classmethod
+    def scaled(cls, n: int) -> "Network":
         def _cadence() -> float:
             r = random.random()
             if r < 0.20:
@@ -236,20 +256,25 @@ class Fleet:
                 return 1.0
             return 2.0
 
-        return cls(
-            [
-                Vehicle(
-                    f"TRUCK_{i:04d}",
-                    round(random.uniform(4.5, 6.0), 1),
-                    random.randint(25, 40),
-                    interval_seconds=_cadence(),
-                )
-                for i in range(1, n + 1)
-            ]
-        )
+        chargers = []
+        for i in range(1, n + 1):
+            site_id, site_region, lat, lng = _SITES[i % len(_SITES)]
+            connector_type = random.choice(_CONNECTOR_TYPES)
+            chargers.append(Charger(
+                charger_id=f"SG-{i:04d}",
+                temp_threshold=round(random.uniform(45.0, 60.0), 1),
+                session_buffer_threshold=random.randint(5, 15),
+                charger_lat=lat,
+                charger_lng=lng,
+                rated_power_kw=_rated_power(connector_type),
+                site_id=site_id,
+                site_region=site_region,
+                interval_seconds=_cadence(),
+            ))
+        return cls(chargers)
 
     def __iter__(self):
-        return iter(self.vehicles)
+        return iter(self.chargers)
 
 
 def create_producer() -> KafkaProducer:
@@ -292,42 +317,42 @@ def _rate_reporter(stop: threading.Event, interval: float = 5.0) -> None:
 # === END DIAGNOSTIC ===
 
 
-def worker(shard: list[Vehicle], producer: KafkaProducer, stop: threading.Event) -> None:
+def worker(shard: list[Charger], producer: KafkaProducer, stop: threading.Event) -> None:
     now = time.time()
-    heap = [(now + vehicle.interval_seconds * i / len(shard), vehicle) for i, vehicle in enumerate(shard)]
+    heap = [(now + charger.interval_seconds * i / len(shard), charger) for i, charger in enumerate(shard)]
     heapq.heapify(heap)
 
     while not stop.is_set():
-        next_time, vehicle = heapq.heappop(heap)
+        next_time, charger = heapq.heappop(heap)
         wait = next_time - time.time()
         if wait > 0:
             stop.wait(wait)
         if stop.is_set():
             break
-        event = vehicle.generate_event()
+        event = charger.generate_event()
         producer.send(
             TOPIC,
-            key=vehicle.vehicle_id.encode(),
+            key=charger.charger_id.encode(),
             value=event.to_json_bytes(),
         )
         print(
-            f"[{vehicle.vehicle_id}] {vehicle.trip_state} | "
-            f"{vehicle.current_scenario().state} | interval={vehicle.interval_seconds}s | "
+            f"[{charger.charger_id}] {charger.session_state} | "
+            f"{charger.current_scenario().state} | interval={charger.interval_seconds}s | "
             f"event_ts={event.event_ts}"
         )
         _record_event()  # DIAGNOSTIC
-        vehicle.advance()
-        heapq.heappush(heap, (time.time() + vehicle.interval_seconds * random.uniform(0.7, 1.3), vehicle))
+        charger.advance()
+        heapq.heappush(heap, (time.time() + charger.interval_seconds * random.uniform(0.7, 1.3), charger))
 
 
-def run(fleet_size: int) -> None:
+def run(network_size: int) -> None:
     num_threads = 4
-    fleet = Fleet.scaled(fleet_size)
+    network = Network.scaled(network_size)
     producer = create_producer()
     stop = threading.Event()
 
-    vehicles = list(fleet)
-    shards = [vehicles[i::num_threads] for i in range(num_threads)]
+    chargers = list(network)
+    shards = [chargers[i::num_threads] for i in range(num_threads)]
 
     threads = [
         threading.Thread(target=worker, args=(shard, producer, stop), daemon=True)
@@ -357,13 +382,13 @@ def run(fleet_size: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--fleet-size",
+        "--network-size",
         type=int,
         default=3,
-        help="Number of vehicles in fleet (default: 3)",
+        help="Number of chargers in network (default: 3)",
     )
     args = parser.parse_args()
-    run(args.fleet_size)
+    run(args.network_size)
 
 
 if __name__ == "__main__":

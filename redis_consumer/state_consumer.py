@@ -22,18 +22,18 @@ RISK_ALERTS_TOPIC = "risk-alerts"
 CONSUMER_GROUP = "logishield-redis-state"
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
-TRUCK_KEY_TTL_SECONDS = 420
+CHARGER_KEY_TTL_SECONDS = 420
 
 
-def _recount_fleet(r: redis.Redis) -> None:
+def _recount_network(r: redis.Redis) -> None:
     counts: dict[str, int] = {}
-    for key in r.scan_iter("truck:*"):
+    for key in r.scan_iter("charger:*"):
         tier = r.hget(key, "tier")
         if tier:
             counts[tier] = counts.get(tier, 0) + 1
-    r.delete("fleet:counts")
+    r.delete("network:counts")
     if counts:
-        r.hset("fleet:counts", mapping=counts)
+        r.hset("network:counts", mapping=counts)
 
 
 def run(verbose: bool = False) -> None:
@@ -47,8 +47,8 @@ def run(verbose: bool = False) -> None:
         )
         raise
 
-    _recount_fleet(r)
-    print("[state_consumer] fleet:counts rebuilt from active truck keys")
+    _recount_network(r)
+    print("[state_consumer] network:counts rebuilt from active charger keys")
 
     consumer = KafkaConsumer(
         RISK_ALERTS_TOPIC,
@@ -64,56 +64,60 @@ def run(verbose: bool = False) -> None:
     for msg in consumer:
         try:
             alert = msg.value
-            vehicle_id = alert.get("vehicle_id")
+            charger_id = alert.get("charger_id")
             tier = alert.get("risk_tier")
-            if not vehicle_id or not tier:
+            if not charger_id or not tier:
                 continue
 
-            truck_key = f"truck:{vehicle_id}"
-            prev_tier = r.hget(truck_key, "tier")
+            charger_key = f"charger:{charger_id}"
+            prev_tier = r.hget(charger_key, "tier")
 
             r.hset(
-                truck_key,
+                charger_key,
                 mapping={
-                    "vehicle_id": vehicle_id,
+                    "charger_id": charger_id,
                     "tier": tier,
-                    "delivery_buffer": str(alert.get("delivery_buffer", "")),
+                    "session_buffer": str(alert.get("session_buffer", "")),
                     "avg_temperature": str(alert.get("avg_temperature", "")),
                     "window_start": alert.get("window_start", ""),
                     "window_end": alert.get("window_end", ""),
                     "alert_ts": alert.get("alert_ts", ""),
                     "reason": alert.get("reason", ""),
-                    "trip_state": alert.get("trip_state", ""),
-                    "trip_id": alert.get("trip_id", ""),
-                    "cargo_type": alert.get("cargo_type", ""),
-                    "cargo_value": str(alert.get("cargo_value", "")),
-                    "customer_priority": alert.get("customer_priority", ""),
-                    "service_level": alert.get("service_level", ""),
-                    "destination_region": alert.get("destination_region", ""),
-                    "route_progress": str(alert.get("route_progress", "")),
-                    "estimated_arrival_minutes": str(alert.get("estimated_arrival_minutes", "")),
-                    "remaining_stops": str(alert.get("remaining_stops", "")),
-                    "driver_hours_remaining": str(alert.get("driver_hours_remaining", "")),
+                    "session_state": alert.get("session_state", ""),
+                    "session_id": alert.get("session_id", ""),
+                    "connector_type": alert.get("connector_type", ""),
+                    "energy_requested_kwh": str(alert.get("energy_requested_kwh", "")),
+                    "user_tier": alert.get("user_tier", ""),
+                    "charging_speed": alert.get("charging_speed", ""),
+                    "site_region": alert.get("site_region", ""),
+                    "session_progress": str(alert.get("session_progress", "")),
+                    "estimated_completion_minutes": str(alert.get("estimated_completion_minutes", "")),
+                    "power_output_kw": str(alert.get("power_output_kw", "")),
+                    "energy_delivered_kwh": str(alert.get("energy_delivered_kwh", "")),
+                    "charger_lat": str(alert.get("charger_lat", "")),
+                    "charger_lng": str(alert.get("charger_lng", "")),
+                    "rated_power_kw": str(alert.get("rated_power_kw", "")),
+                    "site_id": alert.get("site_id", ""),
                 },
             )
-            r.expire(truck_key, TRUCK_KEY_TTL_SECONDS)
+            r.expire(charger_key, CHARGER_KEY_TTL_SECONDS)
 
             if prev_tier != tier:
                 if prev_tier:
-                    r.hincrby("fleet:counts", prev_tier, -1)
-                r.hincrby("fleet:counts", tier, 1)
+                    r.hincrby("network:counts", prev_tier, -1)
+                r.hincrby("network:counts", tier, 1)
 
             r.hset(
-                "fleet:last_update",
+                "network:last_update",
                 mapping={
                     "ts": datetime.now(timezone.utc).isoformat(),
-                    "vehicle_id": vehicle_id,
+                    "charger_id": charger_id,
                     "tier": tier,
                 },
             )
 
             if verbose:
-                print(f"[state_consumer] {vehicle_id} → {tier} (prev: {prev_tier or 'new'})")
+                print(f"[state_consumer] {charger_id} → {tier} (prev: {prev_tier or 'new'})")
         except Exception as exc:
             print(f"[state_consumer] skipping malformed message: {exc}", file=sys.stderr)
             continue

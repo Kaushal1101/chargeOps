@@ -1115,4 +1115,92 @@ The enriched trip schema now flows end-to-end through the full pipeline:
 
 **Simulator → Kafka → Spark → `risk-alerts` → Redis → Dashboard**
 
+---
+
+## 2026-07-03 — Phase 9: Domain Pivot to EV Charging Network Operations
+
+### Why We Pivoted
+
+After completing Phase 8, the underlying streaming architecture was mature: a stateful Kafka → Spark → Redis → Dashboard pipeline with realistic lifecycle simulation, windowed risk classification, event-time watermarking, and transition-deduplication alerting. However, the "truck delivery monitoring" narrative was generic and lacked a clear operational problem.
+
+The decision was made to migrate the domain to **EV charging network operations** — a real-time platform for monitoring the health and availability of a distributed EV charging network across Singapore. The operational problem is more compelling: operators need to know which chargers are degraded, faulted, or overloaded in real time, before sessions fail or customers are stranded.
+
+The architecture is unchanged. Every distributed systems property built across Phases 1–8 is preserved:
+- Kafka as the central event bus
+- Spark Structured Streaming with sliding windows and watermarking
+- Stateful foreachBatch transition deduplication
+- Redis per-asset state with TTL-based eviction
+- Streamlit operations dashboard
+
+Only the domain vocabulary changed. Trucks became chargers. Trips became sessions. Cargo temperature became charger temperature. The delivery buffer became the session buffer.
+
+The pivot also positions the project for a future capability that was not feasible in the truck domain: **geographic charger recommendations**. Every charger now carries real Singapore coordinates (`charger_lat`, `charger_lng`) in its schema, enabling a future map-based view and best-charger query without any pipeline changes.
+
+---
+
+## 2026-07-03 — Phase 9A: Simulator and Data Model
+
+### What Was Completed
+
+- `simulator/models.py` — `TelemetryEvent` migrated to EV schema: `charger_id`, `charger_temperature`, `session_state`, `session_id`, `connector_type`, `energy_requested_kwh`, `user_tier`, `charging_speed`, `site_region`, `session_progress`, `power_output_kw`, `energy_delivered_kwh`, `session_time_remaining`, `session_buffer_threshold`, `temp_threshold`, `estimated_completion_minutes`. New static fields: `charger_lat`, `charger_lng`, `rated_power_kw`, `site_id`.
+- `simulator/simulator.py` — `Vehicle` → `Charger`, `Fleet` → `Network`, `TripContext` → `SessionContext`. Lifecycle states renamed: `IDLE → AVAILABLE`, `LOADING → INITIALIZING`, `IN_TRANSIT → CHARGING`, `DELIVERY_COMPLETE → SESSION_COMPLETE`. `Scenario.generate_values()` updated for charger temperature and session timing ranges. Singapore site pool added (`_SITES`, 10 locations). `_rated_power()` helper assigns kW capacity by connector type. Kafka topic updated to `charger-telemetry`. CLI arg `--fleet-size` → `--network-size`.
+- `docker-compose.yml` — `kafka-init` updated to create `charger-telemetry` topic instead of `fleet-telemetry`.
+
+### Bug Fixed During Review: `site_region` Inconsistency
+
+Cursor assigned `site_region` via `SessionContext.generate()`, which picked randomly from `_SITE_REGIONS`. This meant a charger physically at Changi Airport (East) could report `site_region="North"` during a session — inconsistent with `charger_lat`, `charger_lng`, and `site_id`.
+
+Fix: removed `site_region` from `SessionContext`. Added it as a static field on `Charger`, assigned from the `_SITES` pool at construction time and emitted on every event from `self.site_region`. Guarantees geographic consistency across all charger fields.
+
+### Key Design Decisions
+
+**`site_region` as a static charger property, not a session property**
+`site_region` reflects physical location, which does not change between sessions. Assigning it per-session would decouple it from `charger_lat`/`charger_lng`/`site_id`, breaking geographic consistency. The fix stores it on the `Charger` alongside the other static location fields.
+
+**`estimated_completion_minutes` replaces both `time_left_to_destination` and `estimated_arrival_minutes`**
+The old schema had two time fields that both expressed "time remaining." In the EV schema, these are merged into a single clean field: `estimated_completion_minutes`. The Scenario-generated value drives the risk signal (session buffer); the dynamically computed value from `_compute_dynamic_fields()` is no longer needed as a separate field.
+
+**`power_output_kw` replaces `remaining_stops`**
+Real-time power delivery is the EV equivalent of operational progress. A charger derated to 30% of rated capacity is the most operationally interesting live signal for network operators.
+
+### Bug Found During Testing: `charger-telemetry` Topic Missing
+
+After updating `docker-compose.yml`, Docker containers were already running from the previous configuration. `kafka-init` only runs on first start and does not re-run. The `charger-telemetry` topic did not exist, causing the Kafka producer's `send()` call to block waiting for topic metadata — worker threads appeared to run but generated 0 events.
+
+Fix: created the topic manually with `docker exec kafka kafka-topics --bootstrap-server localhost:9092 --create --topic charger-telemetry --partitions 12 --replication-factor 1`. For future reference: whenever `docker-compose.yml` topic names change, restart Docker or create missing topics manually if containers are already running.
+
+---
+
+## 2026-07-03 — Phase 9B: Spark Stream Processor
+
+### What Was Completed
+
+- `spark_streaming/stream_processor.py` — `TELEMETRY_SCHEMA` updated to EV field names. `structured` select updated. `session_buffer = session_time_remaining - estimated_completion_minutes` replaces `delivery_buffer`. Filter updated: `col("session_state") == "CHARGING"`. `groupBy` updated to `charger_id`. All 18 aggregations updated including new fields: `charger_lat`, `charger_lng`, `rated_power_kw`, `site_id`, `max_power_output_kw`, `max_energy_delivered_kwh`. Risk tiering updated to reference `avg_session_buffer` and `avg_charger_temperature`. `alert_records` select updated with EV reason strings. Deduplication key updated to `(charger_id, session_id)`. Topic subscription updated to `charger-telemetry`.
+
+### What Was Not Changed
+
+SparkSession configuration, watermark duration, window size and slide, `foreachBatch` pattern, checkpoint location, output topic (`risk-alerts`), `gen_id` UDF, trigger interval, output mode. The distributed systems core is identical.
+
+### Checkpoint Note
+
+Checkpoint must be cleared before restarting Spark after this change:
+`rm -rf /tmp/logishield-checkpoints/risk-alerts`
+
+---
+
+## 2026-07-03 — Phase 9C: Redis Consumer and Dashboard
+
+### What Was Completed
+
+- `redis_consumer/state_consumer.py` — `_recount_fleet()` → `_recount_network()`. All key prefixes updated: `truck:` → `charger:`, `fleet:counts` → `network:counts`, `fleet:last_update` → `network:last_update`. `hset` mapping updated to all 23 EV fields including geographic fields. `CHARGER_KEY_TTL_SECONDS` renamed. Verbose log updated.
+- `dashboard/app.py` — `TRUCK_COLUMNS` → `CHARGER_COLUMNS` with EV field set. All Redis key reads updated. Section headers updated: Network Summary, Active Chargers, Charger Lookup. `_fmt_route_progress()` → `_fmt_session_progress()`. Scan pattern updated to `charger:*`. Sort key updated to `charger_id`. Lookup updated to `charger:{charger_id}`.
+
+### Phase 9 Complete
+
+The full pipeline now operates as an EV charging network operations platform:
+
+**Charger Simulator → `charger-telemetry` → Spark → `risk-alerts` → Redis → Dashboard**
+
+Every layer carries the EV schema end-to-end. The distributed systems architecture built across Phases 1–8 is fully preserved. The domain is now operationally meaningful, geographically anchored to Singapore, and structured to support future capabilities (map view, best-charger recommendations) without pipeline changes.
+
 Every layer — Spark output, Redis hash, and dashboard table — carries `trip_state`, route progress, and arrival estimates alongside the existing risk fields. The pipeline now represents a realistic logistics lifecycle observable from telemetry through to the operations dashboard without any change to the underlying risk detection logic.

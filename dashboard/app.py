@@ -18,15 +18,15 @@ STALENESS_THRESHOLD_SECONDS = 600  # 10 minutes — 2× window duration
 REFRESH_INTERVAL_SECONDS = 5
 
 TIER_SORT_ORDER = {"RED": 0, "YELLOW": 1}
-TRUCK_COLUMNS = [
-    "vehicle_id",
+CHARGER_COLUMNS = [
+    "charger_id",
     "tier",
-    "cargo_type",
-    "customer_priority",
-    "trip_state",
-    "route_progress",
-    "estimated_arrival_minutes",
-    "delivery_buffer",
+    "connector_type",
+    "user_tier",
+    "session_state",
+    "session_progress",
+    "estimated_completion_minutes",
+    "session_buffer",
     "avg_temperature",
     "reason",
     "last_update",
@@ -56,7 +56,7 @@ st.header("System Health")
 
 st.write("Redis: Online")
 
-last_update = r.hgetall("fleet:last_update")
+last_update = r.hgetall("network:last_update")
 ts = last_update.get("ts")
 parsed_ts = _parse_ts(ts)
 
@@ -76,10 +76,10 @@ st.caption(
     "A stale timestamp indicates the upstream pipeline may have stopped."
 )
 
-# --- Section 2: Fleet Summary ---
-st.header("Fleet Summary")
+# --- Section 2: Network Summary ---
+st.header("Network Summary")
 
-counts = r.hgetall("fleet:counts")
+counts = r.hgetall("network:counts")
 red_count = int(counts.get("RED") or 0)
 yellow_count = int(counts.get("YELLOW") or 0)
 
@@ -87,10 +87,10 @@ col_red, col_yellow = st.columns(2)
 col_red.metric("RED Alerts", red_count)
 col_yellow.metric("YELLOW Alerts", yellow_count)
 
-# --- Section 3: Active Trucks ---
-st.header("Active Trucks")
+# --- Section 3: Active Chargers ---
+st.header("Active Chargers")
 
-def _fmt_route_progress(value: str) -> str:
+def _fmt_session_progress(value: str) -> str:
     try:
         return f"{float(value) * 100:.0f}%"
     except (ValueError, TypeError):
@@ -98,11 +98,11 @@ def _fmt_route_progress(value: str) -> str:
 
 
 trucks: list[dict[str, str]] = []
-for key in r.scan_iter("truck:*"):
+for key in r.scan_iter("charger:*"):
     record = r.hgetall(key)
     if record:
-        row = {col: record.get(col, "") for col in TRUCK_COLUMNS}
-        row["route_progress"] = _fmt_route_progress(row["route_progress"])
+        row = {col: record.get(col, "") for col in CHARGER_COLUMNS}
+        row["session_progress"] = _fmt_session_progress(row["session_progress"])
         trucks.append(row)
 
 if not trucks:
@@ -111,22 +111,22 @@ else:
     trucks.sort(
         key=lambda row: (
             TIER_SORT_ORDER.get(row.get("tier", ""), 99),
-            row.get("vehicle_id", ""),
+            row.get("charger_id", ""),
         )
     )
-    st.dataframe(trucks, column_order=TRUCK_COLUMNS, use_container_width=True)
+    st.dataframe(trucks, column_order=CHARGER_COLUMNS, use_container_width=True)
 
-# --- Section 4: Truck Lookup ---
-st.header("Truck Lookup")
+# --- Section 4: Charger Lookup ---
+st.header("Charger Lookup")
 
-vehicle_id = st.text_input("Vehicle ID")
-if vehicle_id:
-    vehicle_id = vehicle_id.strip().upper()
-    truck = r.hgetall(f"truck:{vehicle_id}")
+charger_id = st.text_input("Charger ID")
+if charger_id:
+    charger_id = charger_id.strip().upper()
+    truck = r.hgetall(f"charger:{charger_id}")
     if truck:
         st.json(truck)
     else:
-        st.write(f"No active alerts for {vehicle_id}.")
+        st.write(f"No active alerts for {charger_id}.")
 
 time.sleep(REFRESH_INTERVAL_SECONDS)
 st.rerun()
