@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pydeck as pdk
 import redis
 import streamlit as st
 import time
@@ -86,6 +87,53 @@ yellow_count = int(counts.get("YELLOW") or 0)
 col_red, col_yellow = st.columns(2)
 col_red.metric("RED Alerts", red_count)
 col_yellow.metric("YELLOW Alerts", yellow_count)
+
+# --- Section 2.5: Alert Map ---
+st.header("Alert Map")
+
+map_rows = []
+for key in r.scan_iter("charger:*"):
+    record = r.hgetall(key)
+    if not record:
+        continue
+    try:
+        lat = float(record.get("charger_lat", 0))
+        lng = float(record.get("charger_lng", 0))
+    except (ValueError, TypeError):
+        continue
+    if lat == 0 or lng == 0:
+        continue
+    tier = record.get("tier", "")
+    if tier not in ("RED", "YELLOW"):
+        continue
+    color = [220, 38, 38] if tier == "RED" else [234, 179, 8]
+    map_rows.append({
+        "lat": lat,
+        "lng": lng,
+        "tier": tier,
+        "charger_id": record.get("charger_id", ""),
+        "site_id": record.get("site_id", ""),
+        "reason": record.get("reason", ""),
+        "color": color,
+    })
+
+if not map_rows:
+    st.caption("No active alerts to display on map.")
+else:
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=map_rows,
+        get_position="[lng, lat]",
+        get_fill_color="color",
+        get_radius=300,
+        pickable=True,
+    )
+    view_state = pdk.ViewState(latitude=1.352, longitude=103.820, zoom=11)
+    tooltip = {
+        "html": "<b>{charger_id}</b><br/>{site_id}<br/>Tier: {tier}<br/>{reason}",
+        "style": {"backgroundColor": "#1e1e1e", "color": "white", "fontSize": "12px"},
+    }
+    st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip))
 
 # --- Section 3: Active Chargers ---
 st.header("Active Chargers")

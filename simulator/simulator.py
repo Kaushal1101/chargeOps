@@ -1,11 +1,13 @@
 import argparse
 import heapq
+import json
 import random
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 from kafka import KafkaProducer
@@ -14,33 +16,10 @@ from kafka.errors import KafkaError
 from simulator.models import TelemetryEvent
 
 TOPIC = "charger-telemetry"
+CHARGER_DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "chargers.json"
 
-_CONNECTOR_TYPES = ["CCS2", "CHAdeMO", "Type2", "HPC"]
 _USER_TIERS = ["Standard", "Priority", "Corporate"]
 _CHARGING_SPEEDS = ["Standard", "Fast", "Ultra-Fast"]
-_SITE_REGIONS = ["North", "South", "East", "West", "Central"]
-
-_SITES = [
-    ("Orchard_Central",  "Central", 1.3048, 103.8318),
-    ("Raffles_Place",    "Central", 1.2830, 103.8513),
-    ("Bishan_MRT",       "Central", 1.3526, 103.8352),
-    ("Changi_Airport",   "East",    1.3644, 103.9915),
-    ("Tampines_Hub",     "East",    1.3496, 103.9568),
-    ("Woodlands_Civic",  "North",   1.4382, 103.7890),
-    ("Yishun_Mall",      "North",   1.4304, 103.8354),
-    ("Jurong_East",      "West",    1.3329, 103.7436),
-    ("Buona_Vista",      "West",    1.3067, 103.7904),
-    ("HarbourFront",     "South",   1.2654, 103.8200),
-]
-
-
-def _rated_power(connector_type: str) -> float:
-    return {
-        "Type2":   round(random.uniform(7.0, 22.0), 1),
-        "CCS2":    round(random.uniform(50.0, 150.0), 1),
-        "CHAdeMO": round(random.uniform(50.0, 100.0), 1),
-        "HPC":     round(random.uniform(150.0, 350.0), 1),
-    }[connector_type]
 
 
 class Scenario:
@@ -91,10 +70,10 @@ class SessionContext:
     session_start_time: float
 
     @classmethod
-    def generate(cls) -> "SessionContext":
+    def generate(cls, connector_type: str) -> "SessionContext":
         return cls(
             session_id=str(uuid.uuid4()),
-            connector_type=random.choice(_CONNECTOR_TYPES),
+            connector_type=connector_type,
             energy_requested_kwh=round(random.uniform(10.0, 80.0), 2),
             user_tier=random.choice(_USER_TIERS),
             charging_speed=random.choice(_CHARGING_SPEEDS),
@@ -113,6 +92,7 @@ class Charger:
         rated_power_kw: float,
         site_id: str,
         site_region: str,
+        connector_type: str,
         interval_seconds: float = 1.0,
     ) -> None:
         self.charger_id = charger_id
@@ -123,6 +103,7 @@ class Charger:
         self.rated_power_kw = rated_power_kw
         self.site_id = site_id
         self.site_region = site_region
+        self.connector_type = connector_type
         self.interval_seconds = interval_seconds
         self._step: int = 0
         self.session_state: str = "AVAILABLE"
@@ -135,7 +116,7 @@ class Charger:
             return
         if self.session_state == "AVAILABLE":
             self.session_state = "INITIALIZING"
-            self._session_context = SessionContext.generate()
+            self._session_context = SessionContext.generate(connector_type=self.connector_type)
             self._state_deadline = now + random.uniform(60, 180)
         elif self.session_state == "INITIALIZING":
             self.session_state = "CHARGING"
@@ -241,13 +222,17 @@ class Network:
     @classmethod
     def default(cls) -> "Network":
         return cls([
-            Charger("SG-ORC-01", 50.0, 10, 1.3048, 103.8318, 150.0, "Orchard_Central", "Central"),
-            Charger("SG-CBD-01", 45.0, 10, 1.2830, 103.8513,  50.0, "Raffles_Place",   "Central"),
-            Charger("SG-CHG-01", 55.0, 10, 1.3644, 103.9915, 350.0, "Changi_Airport",  "East"),
+            Charger("SG-ORC-01", 50.0, 10, 1.3048, 103.8318, 150.0, "Orchard_Central", "Central", "CCS2"),
+            Charger("SG-CBD-01", 45.0, 10, 1.2830, 103.8513,  50.0, "Raffles_Place",   "Central", "CCS2"),
+            Charger("SG-CHG-01", 55.0, 10, 1.3644, 103.9915, 350.0, "Changi_Airport",  "East", "CCS2"),
         ])
 
     @classmethod
-    def scaled(cls, n: int) -> "Network":
+    def from_dataset(
+        cls,
+        path: Path = CHARGER_DATA_PATH,
+        n: int | None = None,
+    ) -> "Network":
         def _cadence() -> float:
             r = random.random()
             if r < 0.20:
@@ -256,19 +241,23 @@ class Network:
                 return 1.0
             return 2.0
 
+        records = json.loads(path.read_text(encoding="utf-8"))
+        selected_records = records
+        if n is not None and n < len(records):
+            selected_records = random.sample(records, n)
+
         chargers = []
-        for i in range(1, n + 1):
-            site_id, site_region, lat, lng = _SITES[i % len(_SITES)]
-            connector_type = random.choice(_CONNECTOR_TYPES)
+        for record in selected_records:
             chargers.append(Charger(
-                charger_id=f"SG-{i:04d}",
+                charger_id=record["charger_id"],
                 temp_threshold=round(random.uniform(45.0, 60.0), 1),
                 session_buffer_threshold=random.randint(5, 15),
-                charger_lat=lat,
-                charger_lng=lng,
-                rated_power_kw=_rated_power(connector_type),
-                site_id=site_id,
-                site_region=site_region,
+                charger_lat=float(record["latitude"]),
+                charger_lng=float(record["longitude"]),
+                rated_power_kw=float(record["rated_power_kw"]),
+                site_id=record["site_id"],
+                site_region=record["site_region"],
+                connector_type=record["connector_type"],
                 interval_seconds=_cadence(),
             ))
         return cls(chargers)
@@ -347,7 +336,7 @@ def worker(shard: list[Charger], producer: KafkaProducer, stop: threading.Event)
 
 def run(network_size: int) -> None:
     num_threads = 4
-    network = Network.scaled(network_size)
+    network = Network.from_dataset(n=network_size)
     producer = create_producer()
     stop = threading.Event()
 
@@ -385,7 +374,7 @@ def main() -> None:
         "--network-size",
         type=int,
         default=3,
-        help="Number of chargers in network (default: 3)",
+        help="Number of real chargers to load from data/chargers.json (default: 3)",
     )
     args = parser.parse_args()
     run(args.network_size)

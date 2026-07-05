@@ -1204,3 +1204,100 @@ The full pipeline now operates as an EV charging network operations platform:
 Every layer carries the EV schema end-to-end. The distributed systems architecture built across Phases 1–8 is fully preserved. The domain is now operationally meaningful, geographically anchored to Singapore, and structured to support future capabilities (map view, best-charger recommendations) without pipeline changes.
 
 Every layer — Spark output, Redis hash, and dashboard table — carries `trip_state`, route progress, and arrival estimates alongside the existing risk fields. The pipeline now represents a realistic logistics lifecycle observable from telemetry through to the operations dashboard without any change to the underlying risk detection logic.
+
+---
+
+## 2026-07-04 — Phase 10A: Real Singapore Charger Data — Source Evaluation
+
+### What Was Completed
+
+- Evaluated LTA DataMall EVCBatch API as the source for real Singapore EV charger inventory
+- Fetched raw dataset using pre-signed S3 URL mechanism (API key authenticated, URL valid for 5 minutes)
+- Confirmed data quality: 2,708 locations, 8,877 charging points, real coordinates and operator names
+- Added `data/chargers_raw.json` to `.gitignore` (3.1 MB raw API response, not committed)
+
+### Dataset Quality
+
+| Metric | Value |
+|---|---|
+| Total locations | 2,708 |
+| Total charging points | 8,877 |
+| Geographic coverage | Singapore-wide, WGS84 coordinates |
+| Connector types present | Type 2, CCS2 (Combo 2), CHAdeMO |
+| Power range | 3.7 – 480.0 kW |
+| Operators identified | SP Mobility, ComfortDelGro Engie, Shell, Charge+, Strides YTL, and others |
+| Last updated | 2026-07-03 16:35:00 |
+
+### Data Source Decision
+
+LTA DataMall met all acceptance criteria: 8,877 charger records, latitude and longitude present for all records, real site names and addresses, power ratings for all entries, and major operator names correctly attributed. No fallback to a curated hand-built dataset was needed.
+
+---
+
+## 2026-07-04 — Phase 10B: Data Normalisation
+
+### What Was Completed
+
+- `scripts/build_charger_snapshot.py` — one-time normalisation script that reads `data/chargers_raw.json` and writes `data/chargers.json`
+- `data/chargers.json` — committed normalised snapshot of 8,877 real Singapore EV charger records
+
+### Normalisation Logic
+
+- One charger record per `chargingPoint` in the raw dataset, keyed by the first `evCpId`
+- Best plug type selected per charging point: highest `powerRating` wins
+- Connector type mapped: `"Type 2"` → `"Type2"`, `"Combo 2"` → `"CCS2"`, `"CHAdeMO"` → `"CHAdeMO"`
+- Site region derived from WGS84 coordinates using Singapore bounding boxes (South/North/East/West/Central)
+- Site ID slugified from site name (alphanumeric + underscores, max 50 characters)
+
+### Output Statistics
+
+| Metric | Value |
+|---|---|
+| Total chargers | 8,877 |
+| East | 3,077 |
+| Central | 2,576 |
+| West | 1,785 |
+| North | 1,384 |
+| South | 55 |
+| Type2 connectors | 8,095 |
+| CCS2 connectors | 782 |
+| Power range | 3.7 – 480.0 kW |
+
+To regenerate the snapshot: `python scripts/build_charger_snapshot.py` (requires `data/chargers_raw.json`; re-fetch via `scripts/fetch_chargers.py`).
+
+---
+
+## 2026-07-04 — Phase 10C: Simulator Integration
+
+### What Was Completed
+
+- `simulator/simulator.py` — `Network.from_dataset()` classmethod added; loads from `data/chargers.json`
+- `Charger.__init__` updated to accept `connector_type` as a constructor parameter, stored as `self.connector_type`
+- `SessionContext.generate()` updated to accept `connector_type: str` — sessions now use the charger's real connector type rather than a random selection
+- `_SITES`, `_rated_power()`, `_CONNECTOR_TYPES`, `_SITE_REGIONS` removed — all static charger properties now come from the dataset
+- CLI `--network-size` samples N chargers from the dataset (default: 3 for development; pass `8877` for full network)
+
+### Key Design Decision
+
+**`connector_type` flows dataset → Charger → SessionContext, not random**
+Each physical charger supports a fixed connector type. Sessions at that charger must use the charger's type. Removing the random selection ensures every telemetry event carries the correct connector type for the physical hardware it represents.
+
+---
+
+## 2026-07-04 — Phase 10D: Alert Map
+
+### What Was Completed
+
+- `dashboard/app.py` — Alert Map section added between Network Summary and Active Chargers
+- Uses `st.pydeck_chart` with a `pydeck.ScatterplotLayer` over Singapore
+- RED alerts rendered as red dots `[220, 38, 38]`, YELLOW alerts as yellow dots `[234, 179, 8]`
+- Tooltip shows `charger_id`, `site_id`, tier, and reason on hover
+- Map centered on Singapore (lat 1.352, lng 103.820), zoom 11
+
+### No Pipeline Changes
+
+`charger_lat` and `charger_lng` were already stored in every `charger:{id}` Redis hash since Phase 9. The map reads from the same Redis keys as the Active Chargers table — no schema changes, no new Redis writes, no Spark changes required.
+
+### Phase 10 Complete
+
+The simulator now loads real Singapore EV charger records as its network inventory. Charger IDs, coordinates, site names, connector types, power ratings, and operator names reflect the actual Singapore public charging network as of July 2026. The dashboard map shows alerted chargers at their real geographic locations across Singapore.

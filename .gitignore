@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 *.pyo
 benchmarks/results/
+data/chargers_raw.json

@@ -53,22 +53,17 @@ Chargers are classified GREEN, YELLOW, or RED on a rolling 5-minute sliding wind
 
 ## Charger Network
 
-The simulator models a network of EV charging stations distributed across Singapore, each with a fixed geographic location:
+The simulator loads real Singapore EV charger inventory from `data/chargers.json`, a normalised snapshot built from the LTA DataMall EVCBatch dataset (sourced July 2026).
 
-| Site | Region | Connector types |
-|---|---|---|
-| Orchard Central | Central | CCS2, HPC |
-| Raffles Place | Central | CHAdeMO |
-| Bishan MRT | Central | Type2 |
-| Changi Airport | East | HPC |
-| Tampines Hub | East | CCS2 |
-| Woodlands Civic | North | CCS2 |
-| Yishun Mall | North | Type2 |
-| Jurong East | West | CCS2 |
-| Buona Vista | West | CHAdeMO |
-| HarbourFront | South | Type2 |
+| Metric | Value |
+|---|---|
+| Total chargers | 8,877 |
+| Regions | North, South, East, West, Central |
+| Connector types | Type2 (8,095), CCS2 (782) |
+| Power range | 3.7 – 480.0 kW |
+| Operators | SP Mobility, ComfortDelGro Engie, Shell, Charge+, Strides YTL, and others |
 
-Each charger carries `charger_lat` and `charger_lng` coordinates in every telemetry event, enabling future geographic visualisation without pipeline changes.
+Use `--network-size N` to sample N chargers for development. Omit or pass the full count for a production-scale run. Every charger carries real `charger_lat` / `charger_lng` coordinates, visible on the dashboard map.
 
 ## Prerequisites
 

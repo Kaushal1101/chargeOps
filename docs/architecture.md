@@ -60,12 +60,13 @@ The platform follows an event-driven architecture with clear separation between 
 
 | Component | Responsibility |
 |---|---|
-| Simulator | Generates realistic EV charger telemetry and session lifecycle events across a simulated Singapore charging network |
+| Charger Inventory (`data/chargers.json`) | Committed snapshot of 8,877 real Singapore EV charger records sourced from LTA DataMall. Contains charger ID, site name, site region, WGS84 coordinates, connector type, rated power, and operator. Read at simulator startup — no API calls required at runtime. |
+| Simulator | Loads charger inventory and generates realistic EV charger telemetry and session lifecycle events across a simulated Singapore charging network |
 | Kafka | Serves as the event bus between producers and consumers |
 | Spark Streaming | Processes telemetry events, computes windowed metrics, and classifies charger health |
 | Risk Tiering Engine | Assigns GREEN, YELLOW, or RED based on charger temperature and session buffer signals |
 | Redis Consumer | Materialises alert state into Redis hashes keyed by charger ID |
-| Streamlit Dashboard | Read-only network operations console showing active charger alerts and session context |
+| Streamlit Dashboard | Read-only network operations console showing active charger alerts, session context, and a geographic map of alerted chargers |
 | Chaos Injector | Simulates out-of-order events, delayed bursts, and packet loss |
 | Benchmarking Suite | Measures throughput, latency, and consumer lag |
 
