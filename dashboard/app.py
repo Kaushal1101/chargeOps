@@ -77,6 +77,56 @@ st.caption(
     "A stale timestamp indicates the upstream pipeline may have stopped."
 )
 
+# --- Section 1.5: Network Statistics ---
+st.header("Network Statistics")
+
+network_stats = r.hgetall("stats:network")
+
+if not network_stats:
+    st.caption("No statistics available yet — waiting for Spark stats sink.")
+else:
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Active Sessions", network_stats.get("total_active_sessions", "—"))
+    col2.metric("Avg Temperature", f"{network_stats.get('avg_temperature', '—')} °C")
+    col3.metric("Avg Session Buffer", f"{network_stats.get('avg_session_buffer', '—')} min")
+    col4.metric("Avg Power Output", f"{network_stats.get('avg_power_kw', '—')} kW")
+
+    # Regional breakdown
+    region_rows = []
+    for key in sorted(r.scan_iter("stats:region:*")):
+        rec = r.hgetall(key)
+        region = key.split("stats:region:")[-1]
+        region_rows.append({
+            "region": region,
+            "active_sessions": rec.get("active_sessions", ""),
+            "avg_temperature": rec.get("avg_temperature", ""),
+            "avg_session_progress": f"{round(float(rec.get('avg_session_progress', 0)) * 100)}%" if rec.get("avg_session_progress") else "",
+            "avg_session_buffer": rec.get("avg_session_buffer", ""),
+            "avg_power_kw": rec.get("avg_power_kw", ""),
+        })
+
+    if region_rows:
+        st.subheader("By Region")
+        st.dataframe(region_rows, use_container_width=True)
+
+    # Connector breakdown
+    connector_rows = []
+    for key in sorted(r.scan_iter("stats:connector:*")):
+        rec = r.hgetall(key)
+        connector = key.split("stats:connector:")[-1]
+        connector_rows.append({
+            "connector_type": connector,
+            "active_sessions": rec.get("active_sessions", ""),
+            "avg_power_kw": rec.get("avg_power_kw", ""),
+            "avg_rated_power_kw": rec.get("avg_rated_power_kw", ""),
+            "avg_utilization_pct": f"{rec.get('avg_utilization_pct', '')}%",
+            "avg_energy_kwh": rec.get("avg_energy_kwh", ""),
+        })
+
+    if connector_rows:
+        st.subheader("By Connector Type")
+        st.dataframe(connector_rows, use_container_width=True)
+
 # --- Section 2: Network Summary ---
 st.header("Network Summary")
 

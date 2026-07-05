@@ -1301,3 +1301,40 @@ Each physical charger supports a fixed connector type. Sessions at that charger 
 ### Phase 10 Complete
 
 The simulator now loads real Singapore EV charger records as its network inventory. Charger IDs, coordinates, site names, connector types, power ratings, and operator names reflect the actual Singapore public charging network as of July 2026. The dashboard map shows alerted chargers at their real geographic locations across Singapore.
+
+---
+
+## 2026-07-05 — Phase 11: Real-Time Network Analytics
+
+### What Was Completed
+
+- `spark_streaming/stream_processor.py` — second streaming query added in parallel with the existing risk alert query. `write_stats` foreachBatch function computes three groupBy aggregations per micro-batch (by region, by connector type, network-wide) and writes results directly to Redis. `count` added to PySpark imports. `import redis as redis_client` added. `query.awaitTermination()` replaced with `spark.streams.awaitAnyTermination()`.
+- `dashboard/app.py` — Network Statistics section (Section 1.5) added between System Health and Network Summary. Reads `stats:network`, `stats:region:*`, and `stats:connector:*` from Redis. Renders four network-wide metric tiles, a regional breakdown table, and a connector type breakdown table. Degrades gracefully to a caption when Spark stats sink is not yet running.
+- `docs/phases/phase_11/phase_11_analytics.md` — phase plan with questions being answered, Redis key design, and sub-phase structure
+- `docs/limitations.md` — created: documents simulator-driven risk patterns, absence of historical store, single-node infrastructure constraint, and chaos injector staleness
+
+### Redis Keys Written by Stats Sink
+
+| Key pattern | Contents |
+|---|---|
+| `stats:region:{region}` | `active_sessions`, `avg_temperature`, `avg_session_progress`, `avg_session_buffer`, `avg_power_kw`, `last_update` |
+| `stats:connector:{type}` | `active_sessions`, `avg_power_kw`, `avg_rated_power_kw`, `avg_utilization_pct`, `avg_energy_kwh`, `last_update` |
+| `stats:network` | `total_active_sessions`, `avg_temperature`, `avg_session_buffer`, `avg_power_kw`, `last_update` |
+
+### Key Design Decisions
+
+**Stats tapped from `charging` df, not the windowed aggregation**
+The windowed aggregation groups by `charger_id` and collapses many events into one row per charger per window. Tapping it for regional stats would lose the event count signal and produce averages of averages. The `charging` df (post-filter, pre-window) contains one row per raw event, giving correct per-batch counts and true field averages.
+
+**foreachBatch with in-batch groupBy, not a second windowed query**
+Regional stats don't need the same 5-minute sliding window as risk classification — a per-batch snapshot is sufficient. Using foreachBatch with `.groupBy()` inside the function is simpler, has no state to manage, and updates every 5 seconds rather than waiting for a window to close.
+
+**`avg_session_buffer` meaning**
+`session_buffer = session_time_remaining - estimated_completion_minutes`. Positive means sessions are on track; negative means sessions are collectively projected to overrun. The network-wide and regional averages give operators a quick read on whether the network is under session time pressure.
+
+**Separate checkpoint for stats query**
+`/tmp/logishield-checkpoints/charger-stats` is independent of `/tmp/logishield-checkpoints/risk-alerts`. The risk-alerts checkpoint remains valid across this change — no checkpoint clear required.
+
+### Phase 11 Complete
+
+The dashboard now surfaces real-time network analytics derived directly from the telemetry stream. Regional load, connector utilization, and network-wide averages update every 5 seconds alongside the existing alert view.
