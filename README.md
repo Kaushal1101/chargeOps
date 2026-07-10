@@ -100,6 +100,7 @@ The `FLEET_SIZE` cap is the number of real chargers in `data/chargers.json` (8,8
 ├── spark_streaming/    Spark Structured Streaming risk classification pipeline
 ├── redis_consumer/     Kafka consumer that materializes alert state into Redis
 ├── dashboard/          Streamlit network operations console
+├── .streamlit/         Streamlit theme configuration (dark mode, LogiShield brand colors)
 ├── benchmarks/         Throughput and latency measurement suite
 ├── chaos/              Fault injection utilities (out-of-order events, delayed bursts)
 ├── configs/            Shared configuration

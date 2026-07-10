@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime, timezone
 
 import pydeck as pdk
 import requests
@@ -31,6 +32,26 @@ CHARGER_COLUMNS = [
     "last_update",
 ]
 
+
+def _fmt_ts(iso_str: str | None, mode: str = "relative") -> str:
+    if not iso_str:
+        return "never"
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if mode == "relative":
+            delta = int((datetime.now(timezone.utc) - dt).total_seconds())
+            if delta < 60:
+                return f"{delta}s ago"
+            if delta < 3600:
+                return f"{delta // 60}m {delta % 60}s ago"
+            return f"{delta // 3600}h ago"
+        return dt.strftime("%H:%M:%S UTC")
+    except Exception:
+        return iso_str
+
+
 st.set_page_config(page_title="LogiShield Operations", layout="wide")
 
 # --- Fetch data ---
@@ -50,15 +71,16 @@ connector_stats = requests.get(f"{API_BASE_URL}/stats/connectors").json()
 
 # --- Section 1: System Health ---
 st.header("System Health")
-
-st.write("API: Online")
+st.divider()
 
 if health_data["pipeline_active"]:
-    st.write("Pipeline: Active")
-    st.write(f"Last update: {health_data['last_update_ts']}")
+    st.success(
+        f"API Online  |  Pipeline Active  |  Updated "
+        f"{_fmt_ts(health_data['last_update_ts'])}"
+    )
 else:
-    st.write(
-        f"Pipeline: Stalled — last update: {health_data['last_update_ts'] or 'never'}"
+    st.error(
+        f"Pipeline Stalled — last update: {_fmt_ts(health_data['last_update_ts'])}"
     )
 
 st.caption(
@@ -68,6 +90,7 @@ st.caption(
 
 # --- Section 1.5: Network Statistics ---
 st.header("Network Statistics")
+st.divider()
 
 if not network_stats:
     st.caption("No statistics available yet — waiting for Spark stats sink.")
@@ -110,6 +133,7 @@ else:
 
 # --- Section 2: Network Summary ---
 st.header("Network Summary")
+st.divider()
 
 red_count = summary_data["red_alerts"]
 yellow_count = summary_data["yellow_alerts"]
@@ -120,6 +144,7 @@ col_yellow.metric("YELLOW Alerts", yellow_count)
 
 # --- Section 2.5: Alert Map ---
 st.header("Alert Map")
+st.divider()
 
 map_rows = []
 for record in chargers_data:
@@ -166,6 +191,7 @@ else:
 
 # --- Section 3: Active Chargers ---
 st.header("Active Chargers")
+st.divider()
 
 
 def _fmt_session_progress(value: str) -> str:
@@ -180,6 +206,7 @@ for record in chargers_data:
     if record:
         row = {col: record.get(col, "") for col in CHARGER_COLUMNS}
         row["session_progress"] = _fmt_session_progress(row["session_progress"])
+        row["last_update"] = _fmt_ts(row.get("last_update"), mode="relative")
         trucks.append(row)
 
 if not trucks:
@@ -191,10 +218,30 @@ else:
             row.get("charger_id", ""),
         )
     )
-    st.dataframe(trucks, column_order=CHARGER_COLUMNS, use_container_width=True)
+    st.dataframe(
+        trucks,
+        column_order=CHARGER_COLUMNS,
+        use_container_width=True,
+        column_config={
+            "charger_id": st.column_config.TextColumn("Charger ID", width="small"),
+            "tier": st.column_config.TextColumn("Tier", width="small"),
+            "connector_type": st.column_config.TextColumn("Connector", width="small"),
+            "user_tier": st.column_config.TextColumn("User Tier", width="small"),
+            "session_state": st.column_config.TextColumn("State", width="small"),
+            "session_progress": st.column_config.TextColumn("Progress", width="small"),
+            "estimated_completion_minutes": st.column_config.TextColumn(
+                "ETA (min)", width="small"
+            ),
+            "session_buffer": st.column_config.TextColumn("Buffer", width="small"),
+            "avg_temperature": st.column_config.TextColumn("Temp (°C)", width="small"),
+            "reason": st.column_config.TextColumn("Reason", width="medium"),
+            "last_update": st.column_config.TextColumn("Last Seen", width="small"),
+        },
+    )
 
 # --- Section 4: Charger Lookup ---
 st.header("Charger Lookup")
+st.divider()
 
 charger_id = st.text_input("Charger ID")
 if charger_id:
