@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timezone
 
 import pydeck as pdk
 import requests
@@ -16,8 +15,6 @@ import streamlit as st
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 REFRESH_INTERVAL_SECONDS = 5
-MAX_FLEET_SIZE = 8877
-ALERT_FEED_LIMIT = 50
 
 TIER_SORT_ORDER = {"RED": 0, "YELLOW": 1}
 CHARGER_COLUMNS = [
@@ -36,48 +33,6 @@ CHARGER_COLUMNS = [
 
 st.set_page_config(page_title="LogiShield Operations", layout="wide")
 
-# --- Initialise session state ---
-if "alert_feed" not in st.session_state:
-    st.session_state.alert_feed: list[dict] = []
-if "prev_tiers" not in st.session_state:
-    st.session_state.prev_tiers: dict[str, str] = {}
-
-# --- Sidebar: Controls ---
-with st.sidebar:
-    st.header("Fleet Controls")
-
-    try:
-        config_resp = requests.get(f"{API_BASE_URL}/config", timeout=3)
-        current_size = config_resp.json().get("network_size") if config_resp.ok else None
-    except requests.RequestException:
-        current_size = None
-
-    new_size = st.number_input(
-        "Fleet size",
-        min_value=1,
-        max_value=MAX_FLEET_SIZE,
-        value=current_size or 20,
-        step=10,
-    )
-    if st.button("Apply", use_container_width=True):
-        try:
-            resp = requests.post(
-                f"{API_BASE_URL}/config/fleet-size",
-                json={"size": new_size},
-                timeout=3,
-            )
-            if resp.ok:
-                st.success(f"Fleet size set to {new_size}. Simulator reloads within 5s.")
-            else:
-                st.error("Failed to update fleet size.")
-        except requests.RequestException as e:
-            st.error(f"API error: {e}")
-
-    st.divider()
-    st.header("Live Alerts")
-
-    feed_placeholder = st.empty()
-
 # --- Fetch data ---
 try:
     _health_resp = requests.get(f"{API_BASE_URL}/health", timeout=3)
@@ -92,26 +47,6 @@ chargers_data = requests.get(f"{API_BASE_URL}/chargers").json()
 network_stats = requests.get(f"{API_BASE_URL}/stats/network").json()
 region_stats = requests.get(f"{API_BASE_URL}/stats/regions").json()
 connector_stats = requests.get(f"{API_BASE_URL}/stats/connectors").json()
-
-# --- Update alert feed from tier transitions ---
-now_ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-current_tiers = {rec["charger_id"]: rec["tier"] for rec in chargers_data if rec}
-new_alerts = []
-for charger_id, tier in current_tiers.items():
-    prev = st.session_state.prev_tiers.get(charger_id)
-    if prev != tier:
-        color = "🔴" if tier == "RED" else "🟡"
-        new_alerts.append({"ts": now_ts, "label": f"{color} {charger_id} → {tier}"})
-st.session_state.alert_feed = (new_alerts + st.session_state.alert_feed)[:ALERT_FEED_LIMIT]
-st.session_state.prev_tiers = current_tiers
-
-# --- Render alert feed ---
-with feed_placeholder:
-    if not st.session_state.alert_feed:
-        st.caption("Waiting for alerts...")
-    else:
-        for entry in st.session_state.alert_feed:
-            st.caption(f"`{entry['ts']}` {entry['label']}")
 
 # --- Section 1: System Health ---
 st.header("System Health")
@@ -265,14 +200,10 @@ charger_id = st.text_input("Charger ID")
 if charger_id:
     charger_id = charger_id.strip().upper()
     resp = requests.get(f"{API_BASE_URL}/chargers/{charger_id}")
-    data = resp.json()
-    tier = data.get("tier", "")
-    if tier == "GREEN":
-        st.success(f"{charger_id} — GREEN ({data.get('session_state', '')})")
-    elif tier == "INACTIVE":
-        st.info(f"{charger_id} — INACTIVE (not in current fleet or between sessions)")
+    if resp.status_code == 200:
+        st.json(resp.json())
     else:
-        st.json(data)
+        st.write(f"No data found for {charger_id}.")
 
 time.sleep(REFRESH_INTERVAL_SECONDS)
 st.rerun()

@@ -1,7 +1,6 @@
 import argparse
 import heapq
 import json
-import os
 import random
 import threading
 import time
@@ -11,7 +10,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-import redis as redis_client
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 
@@ -19,8 +17,6 @@ from simulator.models import TelemetryEvent
 
 TOPIC = "charger-telemetry"
 CHARGER_DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "chargers.json"
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 _USER_TIERS = ["Standard", "Priority", "Corporate"]
 _CHARGING_SPEEDS = ["Standard", "Fast", "Ultra-Fast"]
@@ -263,25 +259,6 @@ class Network:
         return iter(self.chargers)
 
 
-def _connect_redis() -> redis_client.Redis | None:
-    try:
-        r = redis_client.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-        r.ping()
-        return r
-    except Exception:
-        return None
-
-
-def _read_network_size(r: redis_client.Redis | None, fallback: int) -> int:
-    if r is None:
-        return fallback
-    try:
-        val = r.get("config:network_size")
-        return int(val) if val else fallback
-    except Exception:
-        return fallback
-
-
 def create_producer() -> KafkaProducer:
     try:
         return KafkaProducer(
@@ -324,7 +301,6 @@ def worker(
     shard: list[Charger],
     producer: KafkaProducer,
     stop: threading.Event,
-    r: redis_client.Redis | None,
 ) -> None:
     now = time.time()
     heap = [
@@ -349,14 +325,6 @@ def worker(
         )
         _record_event()
 
-        # Presence write: lets the API return GREEN/INACTIVE for non-alerting chargers.
-        # Fire-and-forget — never blocks the event loop.
-        if r is not None:
-            try:
-                r.set(f"presence:{charger.charger_id}", charger.session_state, ex=10)
-            except Exception:
-                pass
-
         heapq.heappush(
             heap,
             (time.time() + charger.interval_seconds * random.uniform(0.7, 1.3), charger),
@@ -366,7 +334,6 @@ def worker(
 def _start_workers(
     network_size: int,
     num_threads: int,
-    r: redis_client.Redis | None,
 ) -> tuple[list[threading.Thread], KafkaProducer, threading.Event]:
     stop = threading.Event()
     network = Network.from_dataset(n=network_size)
@@ -374,7 +341,7 @@ def _start_workers(
     chargers = list(network)
     shards = [chargers[i::num_threads] for i in range(num_threads)]
     threads = [
-        threading.Thread(target=worker, args=(shard, producer, stop, r), daemon=True)
+        threading.Thread(target=worker, args=(shard, producer, stop), daemon=True)
         for shard in shards
         if shard
     ]
@@ -387,28 +354,11 @@ def _start_workers(
 
 def run(network_size: int) -> None:
     num_threads = 4
-    r = _connect_redis()
-    if r:
-        print(f"[simulator] Redis connected — fleet size hot-reload enabled")
-    else:
-        print(f"[simulator] Redis unavailable — fleet size hot-reload disabled")
-
-    network_size = _read_network_size(r, network_size)
-    threads, producer, stop = _start_workers(network_size, num_threads, r)
+    threads, producer, stop = _start_workers(network_size, num_threads)
 
     try:
-        while True:
-            time.sleep(5)
-            new_size = _read_network_size(r, network_size)
-            if new_size != network_size:
-                print(f"[simulator] fleet size changed {network_size} → {new_size}, reloading")
-                stop.set()
-                for t in threads:
-                    t.join()
-                producer.flush()
-                producer.close()
-                network_size = new_size
-                threads, producer, stop = _start_workers(network_size, num_threads, r)
+        for t in threads:
+            t.join()
     except KeyboardInterrupt:
         print("[simulator] shutting down...")
         stop.set()
