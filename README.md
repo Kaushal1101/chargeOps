@@ -12,12 +12,16 @@ Apache Kafka (charger-telemetry)
         │
         ▼
 Spark Structured Streaming (session-scoped windowed risk classification)
-        │
-        ▼
+       │ │
+       │ └─── Redis (stats:network / stats:region:* / stats:connector:*)
+       ▼
 Apache Kafka (risk-alerts)
         │
         ▼
-Redis (per-charger operational state)
+Redis Consumer → Redis (charger:* / network:counts / network:last_update)
+        │
+        ▼
+FastAPI Operational API (read-only Redis over HTTP)
         │
         ▼
 Streamlit Dashboard (network operations console)
@@ -40,6 +44,7 @@ Chargers are classified GREEN, YELLOW, or RED on a rolling 5-minute sliding wind
 | Message broker | Apache Kafka |
 | Stream processing | Apache Spark Structured Streaming, PySpark |
 | Operational state | Redis |
+| Operational API | FastAPI, Uvicorn |
 | Dashboard | Streamlit |
 | Infrastructure | Docker Compose |
 
@@ -67,32 +72,26 @@ Use `--network-size N` to sample N chargers for development. Omit or pass the fu
 
 ## Prerequisites
 
-- Docker Desktop — runs Kafka, Zookeeper, Redis, and Spark
-- Python 3.12
-- Java 11 or higher — required by PySpark
+- Docker Desktop
 
 ## Running the Pipeline
 
 ```bash
-# 1. Start infrastructure
-docker-compose up -d
-
-# 2. Start Spark (clear checkpoint on first run or after schema changes)
-rm -rf /tmp/logishield-checkpoints/risk-alerts
-spark-submit \
-  --master 'local[*]' \
-  --packages 'org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1' \
-  spark_streaming/stream_processor.py
-
-# 3. Start the charger simulator
-python -m simulator.simulator --network-size 10
-
-# 4. Start the Redis state consumer
-python -m redis_consumer.state_consumer --verbose
-
-# 5. Start the dashboard
-streamlit run dashboard/app.py
+# Start the full stack with a fleet of 20 chargers
+FLEET_SIZE=20 docker-compose up -d
 ```
+
+The dashboard is available at `http://localhost:8501`. Kafka UI is at `http://localhost:8080`.
+
+For a clean reset (wipes all state and restarts with a new fleet size):
+
+```bash
+docker-compose down -v && FLEET_SIZE=50 docker-compose up -d
+```
+
+`down -v` removes volumes so ZooKeeper and Redis start clean. Redis is also flushed automatically on every `up -d` before consumers start. Spark checkpoints live inside the container and are discarded on container removal.
+
+The `FLEET_SIZE` cap is the number of real chargers in `data/chargers.json` (8,877). Omitting `FLEET_SIZE` defaults to 20.
 
 ## Repository Structure
 

@@ -1338,3 +1338,52 @@ Regional stats don't need the same 5-minute sliding window as risk classificatio
 ### Phase 11 Complete
 
 The dashboard now surfaces real-time network analytics derived directly from the telemetry stream. Regional load, connector utilization, and network-wide averages update every 5 seconds alongside the existing alert view.
+
+---
+
+## 2026-07-10 — Phase 12: FastAPI Layer, Dashboard Decoupled from Redis, Full Containerization
+
+### What Was Completed
+
+- `api/main.py` — new FastAPI service exposing read-only Redis state over HTTP. Endpoints: `/health`, `/summary`, `/chargers`, `/chargers/{id}`, `/stats/network`, `/stats/regions`, `/stats/connectors`
+- `dashboard/app.py` — refactored to be a pure HTTP client to the API. All direct Redis reads removed. Dashboard now has no Redis dependency; the API owns all data access
+- `Dockerfile` — created with `python:3.11-slim` base. Java (`default-jre-headless`) added for Spark. Spark-Kafka connector JAR pre-downloaded into Ivy cache at build time so container startup is instant
+- `docker-compose.yml` — `simulator`, `redis-consumer`, `api`, `dashboard`, and `stream-processor` all containerized. `spark-master` and `spark-worker` removed (unused — Spark runs in `local[*]` mode inside `stream-processor`). `redis-init` service added: runs `redis-cli FLUSHALL` on every startup before consumers begin writing, guaranteeing a clean state each run. `FLEET_SIZE` environment variable controls simulator network size (default: 20)
+- `spark_streaming/stream_processor.py` — `KAFKA_BOOTSTRAP`, `REDIS_HOST`, `REDIS_PORT` now read from environment variables (defaults preserve local dev behaviour). `spark.jars.packages` config baked into `SparkSession` so no `spark-submit` invocation needed
+- `requirements.txt` — `fastapi==0.115.6`, `uvicorn[standard]==0.34.0` added
+
+### Bug Fixed: Stats Sink Inflated Session Counts
+
+`write_stats` used `count("*")` to compute `active_sessions` and `total_active_sessions`. With a 5-second micro-batch and ~1 event/second per charger, each charger contributed ~5 rows per batch — inflating session counts by ~5x.
+
+Fix: replaced `count("*")` with `countDistinct("charger_id")` in all three aggregations (by region, by connector type, network-wide). `countDistinct` imported from `pyspark.sql.functions`.
+
+### Key Design Decisions
+
+**API as the single Redis access boundary**
+Before this phase, the dashboard read directly from Redis. Moving all Redis access into the API means the dashboard has no knowledge of the data store — it only knows HTTP. This makes the dashboard testable in isolation, decouples it from Redis key schema changes, and is the correct layering for a production system.
+
+**Spark containerized in `local[*]` mode, not submitted to a cluster**
+The `spark-master` and `spark-worker` containers were present but never used — the Spark job ran in `local[*]` on the host machine. This phase formalizes that: `stream-processor` is a container that runs `python spark_streaming/stream_processor.py`, which starts Spark in `local[*]` mode within the container. This is correct for a single-node demo and removes the orphaned cluster containers.
+
+**Redis flushed on every startup via `redis-init`**
+A one-shot service runs `redis-cli -h redis FLUSHALL` after Redis is healthy and before `redis-consumer` and `stream-processor` start. This guarantees that every `docker-compose up -d` produces a clean dashboard with no stale state from a previous run.
+
+**Kafka connector JAR pre-downloaded at image build time**
+The previous workflow required `spark.jars.packages` to download the JAR on first run (~10–30s, network-dependent). Triggering a SparkSession at build time populates `~/.ivy2` in the image layer. Subsequent container starts skip the download entirely.
+
+**`FLEET_SIZE` environment variable**
+Fleet size is set via `FLEET_SIZE=N docker-compose up -d`, eliminating the need to edit `docker-compose.yml`. Defaults to 20.
+
+### Clean Start Workflow
+
+```bash
+# Full clean reset with new fleet size
+docker-compose down -v && FLEET_SIZE=50 docker-compose up -d
+```
+
+`down -v` removes ZooKeeper and Redis volumes. `redis-init` flushes Redis before consumers start. Spark checkpoints are discarded with the container. No manual steps required.
+
+### Phase 12 Complete
+
+The entire stack now runs from a single command. No local Java, Python, or `spark-submit` required. `FLEET_SIZE=N docker-compose up -d` is the only command needed to start the pipeline at any scale.
