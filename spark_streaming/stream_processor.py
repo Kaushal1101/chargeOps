@@ -1,7 +1,12 @@
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9093")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 import redis as redis_client
 from pyspark.sql import SparkSession
@@ -87,6 +92,7 @@ def run():
     spark = (
         SparkSession.builder.appName("LogiShield-StreamProcessor")
         .master("local[*]")
+        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1")
         .config("spark.ui.port", "4040")
         .config("spark.sql.shuffle.partitions", "8")
         .config("spark.sql.session.timeZone", "UTC")
@@ -97,7 +103,7 @@ def run():
 
     raw_stream = (
         spark.readStream.format("kafka")
-        .option("kafka.bootstrap.servers", "localhost:9093")
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
         .option("subscribe", "charger-telemetry")
         .option("startingOffsets", "latest")
         .load()
@@ -287,7 +293,7 @@ def run():
         )
 
         kafka_output.write.format("kafka") \
-            .option("kafka.bootstrap.servers", "localhost:9093") \
+            .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP) \
             .option("topic", "risk-alerts") \
             .save()
 
@@ -295,7 +301,7 @@ def run():
         if batch_df.rdd.isEmpty():
             return
 
-        r = redis_client.Redis(host="localhost", port=6379, decode_responses=True)
+        r = redis_client.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
         now = datetime.now(timezone.utc).isoformat()
 
         # By region
