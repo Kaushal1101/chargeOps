@@ -269,7 +269,7 @@ class Network:
 def create_producer() -> KafkaProducer:
     try:
         return KafkaProducer(
-            bootstrap_servers="localhost:9093",
+            bootstrap_servers="kafka:9092",
             value_serializer=lambda v: v,
             retries=3,
             linger_ms=10,
@@ -278,7 +278,7 @@ def create_producer() -> KafkaProducer:
             compression_type="lz4",
         )
     except KafkaError as e:
-        print(f"Failed to connect to Kafka at localhost:9093: {e}")
+        print(f"Failed to connect to Kafka at kafka:9092: {e}")
         raise
 
 

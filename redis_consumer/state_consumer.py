@@ -17,10 +17,10 @@ from datetime import datetime, timezone
 import redis
 from kafka import KafkaConsumer
 
-KAFKA_BOOTSTRAP = "localhost:9093"
+KAFKA_BOOTSTRAP = "kafka:9092"
 RISK_ALERTS_TOPIC = "risk-alerts"
 CONSUMER_GROUP = "logishield-redis-state"
-REDIS_HOST = "localhost"
+REDIS_HOST = "redis"
 REDIS_PORT = 6379
 CHARGER_KEY_TTL_SECONDS = 420
 

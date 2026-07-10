@@ -101,3 +101,49 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: logishield
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+  simulator:
+    build: .
+    container_name: simulator
+    command: python -m simulator.simulator
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: on-failure
+
+  redis-consumer:
+    build: .
+    container_name: redis-consumer
+    command: python -m redis_consumer.state_consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure
+
+  api:
+    build: .
+    container_name: api
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    restart: on-failure
+
+  dashboard:
+    build: .
+    container_name: dashboard
+    command: streamlit run dashboard/app.py --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    environment:
+      API_BASE_URL: http://api:8000
+    restart: on-failure

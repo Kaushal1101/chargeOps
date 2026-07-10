@@ -1,4 +1,4 @@
-"""LogiShield operations dashboard — read-only fleet state from Redis.
+"""LogiShield operations dashboard — read-only fleet state from the Operational API.
 
 Run with:
     streamlit run dashboard/app.py
@@ -6,16 +6,14 @@ Run with:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
-import pydeck as pdk
-import redis
-import streamlit as st
+import os
 import time
 
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-STALENESS_THRESHOLD_SECONDS = 600  # 10 minutes — 2× window duration
+import pydeck as pdk
+import requests
+import streamlit as st
+
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 REFRESH_INTERVAL_SECONDS = 5
 
 TIER_SORT_ORDER = {"RED": 0, "YELLOW": 1}
@@ -34,43 +32,34 @@ CHARGER_COLUMNS = [
 ]
 
 
-def _parse_ts(ts: str | None) -> datetime | None:
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
 st.set_page_config(page_title="LogiShield Operations", layout="wide")
 
 try:
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-    r.ping()
-except redis.RedisError as exc:
-    st.error(f"Redis not reachable at {REDIS_HOST}:{REDIS_PORT}: {exc}")
+    _health_resp = requests.get(f"{API_BASE_URL}/health", timeout=3)
+    _health_resp.raise_for_status()
+except requests.RequestException as exc:
+    st.error(f"API not reachable at {API_BASE_URL}: {exc}")
     st.stop()
+
+health_data = _health_resp.json()
+summary_data = requests.get(f"{API_BASE_URL}/summary").json()
+chargers_data = requests.get(f"{API_BASE_URL}/chargers").json()
+network_stats = requests.get(f"{API_BASE_URL}/stats/network").json()
+region_stats = requests.get(f"{API_BASE_URL}/stats/regions").json()
+connector_stats = requests.get(f"{API_BASE_URL}/stats/connectors").json()
 
 # --- Section 1: System Health ---
 st.header("System Health")
 
-st.write("Redis: Online")
+st.write("API: Online")
 
-last_update = r.hgetall("network:last_update")
-ts = last_update.get("ts")
-parsed_ts = _parse_ts(ts)
-
-if parsed_ts is not None:
-    staleness = (datetime.now(timezone.utc) - parsed_ts).total_seconds()
-else:
-    staleness = STALENESS_THRESHOLD_SECONDS
-
-if parsed_ts is not None and staleness < STALENESS_THRESHOLD_SECONDS:
+if health_data["pipeline_active"]:
     st.write("Pipeline: Active")
-    st.write(f"Last update: {ts}")
+    st.write(f"Last update: {health_data['last_update_ts']}")
 else:
-    st.write(f"Pipeline: Stalled — last update: {ts or 'never'}")
+    st.write(
+        f"Pipeline: Stalled — last update: {health_data['last_update_ts'] or 'never'}"
+    )
 
 st.caption(
     "Kafka and Spark health are inferred from data freshness. "
@@ -79,8 +68,6 @@ st.caption(
 
 # --- Section 1.5: Network Statistics ---
 st.header("Network Statistics")
-
-network_stats = r.hgetall("stats:network")
 
 if not network_stats:
     st.caption("No statistics available yet — waiting for Spark stats sink.")
@@ -91,13 +78,10 @@ else:
     col3.metric("Avg Session Buffer", f"{network_stats.get('avg_session_buffer', '—')} min")
     col4.metric("Avg Power Output", f"{network_stats.get('avg_power_kw', '—')} kW")
 
-    # Regional breakdown
     region_rows = []
-    for key in sorted(r.scan_iter("stats:region:*")):
-        rec = r.hgetall(key)
-        region = key.split("stats:region:")[-1]
+    for rec in sorted(region_stats, key=lambda r: r.get("region", "")):
         region_rows.append({
-            "region": region,
+            "region": rec.get("region", ""),
             "active_sessions": rec.get("active_sessions", ""),
             "avg_temperature": rec.get("avg_temperature", ""),
             "avg_session_progress": f"{round(float(rec.get('avg_session_progress', 0)) * 100)}%" if rec.get("avg_session_progress") else "",
@@ -109,13 +93,10 @@ else:
         st.subheader("By Region")
         st.dataframe(region_rows, use_container_width=True)
 
-    # Connector breakdown
     connector_rows = []
-    for key in sorted(r.scan_iter("stats:connector:*")):
-        rec = r.hgetall(key)
-        connector = key.split("stats:connector:")[-1]
+    for rec in sorted(connector_stats, key=lambda r: r.get("connector_type", "")):
         connector_rows.append({
-            "connector_type": connector,
+            "connector_type": rec.get("connector_type", ""),
             "active_sessions": rec.get("active_sessions", ""),
             "avg_power_kw": rec.get("avg_power_kw", ""),
             "avg_rated_power_kw": rec.get("avg_rated_power_kw", ""),
@@ -130,9 +111,8 @@ else:
 # --- Section 2: Network Summary ---
 st.header("Network Summary")
 
-counts = r.hgetall("network:counts")
-red_count = int(counts.get("RED") or 0)
-yellow_count = int(counts.get("YELLOW") or 0)
+red_count = summary_data["red_alerts"]
+yellow_count = summary_data["yellow_alerts"]
 
 col_red, col_yellow = st.columns(2)
 col_red.metric("RED Alerts", red_count)
@@ -142,8 +122,7 @@ col_yellow.metric("YELLOW Alerts", yellow_count)
 st.header("Alert Map")
 
 map_rows = []
-for key in r.scan_iter("charger:*"):
-    record = r.hgetall(key)
+for record in chargers_data:
     if not record:
         continue
     try:
@@ -188,6 +167,7 @@ else:
 # --- Section 3: Active Chargers ---
 st.header("Active Chargers")
 
+
 def _fmt_session_progress(value: str) -> str:
     try:
         return f"{float(value) * 100:.0f}%"
@@ -196,8 +176,7 @@ def _fmt_session_progress(value: str) -> str:
 
 
 trucks: list[dict[str, str]] = []
-for key in r.scan_iter("charger:*"):
-    record = r.hgetall(key)
+for record in chargers_data:
     if record:
         row = {col: record.get(col, "") for col in CHARGER_COLUMNS}
         row["session_progress"] = _fmt_session_progress(row["session_progress"])
@@ -220,9 +199,9 @@ st.header("Charger Lookup")
 charger_id = st.text_input("Charger ID")
 if charger_id:
     charger_id = charger_id.strip().upper()
-    truck = r.hgetall(f"charger:{charger_id}")
-    if truck:
-        st.json(truck)
+    resp = requests.get(f"{API_BASE_URL}/chargers/{charger_id}")
+    if resp.status_code == 200:
+        st.json(resp.json())
     else:
         st.write(f"No active alerts for {charger_id}.")
 
