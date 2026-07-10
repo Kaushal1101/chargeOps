@@ -93,6 +93,11 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      redis-init:
+        condition: service_completed_successfully
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
     restart: on-failure
 
   redis-consumer:

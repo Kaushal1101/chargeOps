@@ -12,10 +12,12 @@ from typing import NoReturn
 
 import redis
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 STALENESS_THRESHOLD_SECONDS = 600
+MAX_FLEET_SIZE = 8877
 
 app = FastAPI(title="LogiShield Operational API")
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
@@ -84,14 +86,17 @@ def chargers():
 
 @app.get("/chargers/{charger_id}")
 def charger(charger_id: str):
-    key = f"charger:{charger_id.upper()}"
+    cid = charger_id.upper()
     try:
-        data = r.hgetall(key)
+        data = r.hgetall(f"charger:{cid}")
+        if data:
+            return data
+        session_state = r.get(f"presence:{cid}")
+        if session_state:
+            return {"charger_id": cid, "tier": "GREEN", "session_state": session_state}
+        return {"charger_id": cid, "tier": "INACTIVE", "session_state": "UNAVAILABLE"}
     except redis.RedisError:
         _redis_unavailable()
-    if not data:
-        raise HTTPException(status_code=404, detail="Charger not found")
-    return data
 
 
 @app.get("/stats/network")
@@ -124,5 +129,32 @@ def stats_connectors():
             rec["connector_type"] = key.split("stats:connector:")[-1]
             result.append(rec)
         return result
+    except redis.RedisError:
+        _redis_unavailable()
+
+
+@app.get("/config")
+def get_config():
+    try:
+        val = r.get("config:network_size")
+        return {"network_size": int(val) if val else None}
+    except redis.RedisError:
+        _redis_unavailable()
+
+
+class FleetSizeRequest(BaseModel):
+    size: int
+
+
+@app.post("/config/fleet-size")
+def set_fleet_size(body: FleetSizeRequest):
+    if not (1 <= body.size <= MAX_FLEET_SIZE):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fleet size must be between 1 and {MAX_FLEET_SIZE}",
+        )
+    try:
+        r.set("config:network_size", body.size)
+        return {"network_size": body.size, "status": "ok"}
     except redis.RedisError:
         _redis_unavailable()

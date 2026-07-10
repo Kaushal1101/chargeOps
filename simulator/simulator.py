@@ -1,6 +1,7 @@
 import argparse
 import heapq
 import json
+import os
 import random
 import threading
 import time
@@ -10,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+import redis as redis_client
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 
@@ -17,9 +19,18 @@ from simulator.models import TelemetryEvent
 
 TOPIC = "charger-telemetry"
 CHARGER_DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "chargers.json"
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 _USER_TIERS = ["Standard", "Priority", "Corporate"]
 _CHARGING_SPEEDS = ["Standard", "Fast", "Ultra-Fast"]
+
+# Each charging session draws one scenario at session start and holds it for the
+# full session duration. This ensures the Spark 5-minute window sees a clean,
+# unmixed signal rather than an averaged blend of all three states.
+# Weights tuned for ~65% GREEN / ~30% YELLOW / ~3.5% RED at steady state.
+_SCENARIO_STATES = ["GREEN", "YELLOW", "RED"]
+_SCENARIO_WEIGHTS = [0.665, 0.300, 0.035]
 
 
 class Scenario:
@@ -27,13 +38,8 @@ class Scenario:
         self.state = state
 
     @classmethod
-    def from_step(cls, step: int) -> "Scenario":
-        phase = step % 15
-        if phase < 5:
-            return cls("GREEN")
-        if phase < 10:
-            return cls("YELLOW")
-        return cls("RED")
+    def random(cls) -> "Scenario":
+        return cls(random.choices(_SCENARIO_STATES, weights=_SCENARIO_WEIGHTS, k=1)[0])
 
     def generate_values(self, temp_threshold: float, session_buffer_threshold: int) -> dict:
         if self.state == "GREEN":
@@ -68,6 +74,7 @@ class SessionContext:
     user_tier: str
     charging_speed: str
     session_start_time: float
+    scenario: Scenario
 
     @classmethod
     def generate(cls, connector_type: str) -> "SessionContext":
@@ -78,6 +85,7 @@ class SessionContext:
             user_tier=random.choice(_USER_TIERS),
             charging_speed=random.choice(_CHARGING_SPEEDS),
             session_start_time=0.0,
+            scenario=Scenario.random(),
         )
 
 
@@ -105,7 +113,6 @@ class Charger:
         self.site_region = site_region
         self.connector_type = connector_type
         self.interval_seconds = interval_seconds
-        self._step: int = 0
         self.session_state: str = "AVAILABLE"
         self._state_deadline: float = time.time() + random.uniform(30, 90)
         self._session_context: SessionContext | None = None
@@ -144,28 +151,21 @@ class Charger:
         trip_duration = max(self._state_deadline - ctx.session_start_time, 1.0)
 
         session_progress = min(elapsed / trip_duration, 1.0)
-        estimated_completion_minutes = max(
-            0, round((1.0 - session_progress) * (trip_duration / 60.0))
-        )
         power_output_kw = round(self.rated_power_kw * random.uniform(0.7, 1.0), 2)
         energy_delivered_kwh = round(session_progress * ctx.energy_requested_kwh, 3)
 
         return {
             "session_progress": round(session_progress, 4),
-            "estimated_completion_minutes": estimated_completion_minutes,
             "power_output_kw": power_output_kw,
             "energy_delivered_kwh": energy_delivered_kwh,
         }
-
-    def current_scenario(self) -> Scenario:
-        return Scenario.from_step(self._step)
 
     def generate_event(self, event_ts: datetime | None = None) -> TelemetryEvent:
         self._maybe_advance_lifecycle()
         dynamic = self._compute_dynamic_fields()
 
-        if self.session_state == "CHARGING":
-            scenario = self.current_scenario()
+        if self.session_state == "CHARGING" and self._session_context is not None:
+            scenario = self._session_context.scenario
             values = scenario.generate_values(
                 self.temp_threshold, self.session_buffer_threshold
             )
@@ -189,7 +189,7 @@ class Charger:
             charger_temperature=values["charger_temperature"],
             estimated_completion_minutes=values["estimated_completion_minutes"],
             session_time_remaining=values["session_time_remaining"],
-            scenario_state=scenario.state if self.session_state == "CHARGING" else "GREEN",
+            scenario_state=scenario.state if scenario is not None else "GREEN",
             session_buffer_threshold=self.session_buffer_threshold,
             temp_threshold=self.temp_threshold,
             session_state=self.session_state,
@@ -207,9 +207,6 @@ class Charger:
             rated_power_kw=self.rated_power_kw,
             site_id=self.site_id,
         )
-
-    def advance(self) -> None:
-        self._step += 1
 
     def __lt__(self, other: "Charger") -> bool:
         return self.charger_id < other.charger_id
@@ -266,6 +263,25 @@ class Network:
         return iter(self.chargers)
 
 
+def _connect_redis() -> redis_client.Redis | None:
+    try:
+        r = redis_client.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        r.ping()
+        return r
+    except Exception:
+        return None
+
+
+def _read_network_size(r: redis_client.Redis | None, fallback: int) -> int:
+    if r is None:
+        return fallback
+    try:
+        val = r.get("config:network_size")
+        return int(val) if val else fallback
+    except Exception:
+        return fallback
+
+
 def create_producer() -> KafkaProducer:
     try:
         return KafkaProducer(
@@ -282,7 +298,6 @@ def create_producer() -> KafkaProducer:
         raise
 
 
-# === DIAGNOSTIC: event-generation rate counter (temporary; remove this block to disable) ===
 _event_count = 0
 _event_count_lock = threading.Lock()
 
@@ -303,12 +318,19 @@ def _rate_reporter(stop: threading.Event, interval: float = 5.0) -> None:
             f"[DIAGNOSTIC] generated {count} events in {interval:.1f}s "
             f"({count / interval:.1f} ev/s)"
         )
-# === END DIAGNOSTIC ===
 
 
-def worker(shard: list[Charger], producer: KafkaProducer, stop: threading.Event) -> None:
+def worker(
+    shard: list[Charger],
+    producer: KafkaProducer,
+    stop: threading.Event,
+    r: redis_client.Redis | None,
+) -> None:
     now = time.time()
-    heap = [(now + charger.interval_seconds * i / len(shard), charger) for i, charger in enumerate(shard)]
+    heap = [
+        (now + charger.interval_seconds * i / len(shard), charger)
+        for i, charger in enumerate(shard)
+    ]
     heapq.heapify(heap)
 
     while not stop.is_set():
@@ -318,54 +340,83 @@ def worker(shard: list[Charger], producer: KafkaProducer, stop: threading.Event)
             stop.wait(wait)
         if stop.is_set():
             break
+
         event = charger.generate_event()
         producer.send(
             TOPIC,
             key=charger.charger_id.encode(),
             value=event.to_json_bytes(),
         )
-        print(
-            f"[{charger.charger_id}] {charger.session_state} | "
-            f"{charger.current_scenario().state} | interval={charger.interval_seconds}s | "
-            f"event_ts={event.event_ts}"
+        _record_event()
+
+        # Presence write: lets the API return GREEN/INACTIVE for non-alerting chargers.
+        # Fire-and-forget — never blocks the event loop.
+        if r is not None:
+            try:
+                r.set(f"presence:{charger.charger_id}", charger.session_state, ex=10)
+            except Exception:
+                pass
+
+        heapq.heappush(
+            heap,
+            (time.time() + charger.interval_seconds * random.uniform(0.7, 1.3), charger),
         )
-        _record_event()  # DIAGNOSTIC
-        charger.advance()
-        heapq.heappush(heap, (time.time() + charger.interval_seconds * random.uniform(0.7, 1.3), charger))
+
+
+def _start_workers(
+    network_size: int,
+    num_threads: int,
+    r: redis_client.Redis | None,
+) -> tuple[list[threading.Thread], KafkaProducer, threading.Event]:
+    stop = threading.Event()
+    network = Network.from_dataset(n=network_size)
+    producer = create_producer()
+    chargers = list(network)
+    shards = [chargers[i::num_threads] for i in range(num_threads)]
+    threads = [
+        threading.Thread(target=worker, args=(shard, producer, stop, r), daemon=True)
+        for shard in shards
+        if shard
+    ]
+    threading.Thread(target=_rate_reporter, args=(stop,), daemon=True).start()
+    for t in threads:
+        t.start()
+    print(f"[simulator] running with {network_size} chargers across {len(threads)} threads")
+    return threads, producer, stop
 
 
 def run(network_size: int) -> None:
     num_threads = 4
-    network = Network.from_dataset(n=network_size)
-    producer = create_producer()
-    stop = threading.Event()
+    r = _connect_redis()
+    if r:
+        print(f"[simulator] Redis connected — fleet size hot-reload enabled")
+    else:
+        print(f"[simulator] Redis unavailable — fleet size hot-reload disabled")
 
-    chargers = list(network)
-    shards = [chargers[i::num_threads] for i in range(num_threads)]
-
-    threads = [
-        threading.Thread(target=worker, args=(shard, producer, stop), daemon=True)
-        for shard in shards
-        if shard
-    ]
-
-    # DIAGNOSTIC: start event-rate reporter
-    threading.Thread(target=_rate_reporter, args=(stop,), daemon=True).start()
-
-    for t in threads:
-        t.start()
+    network_size = _read_network_size(r, network_size)
+    threads, producer, stop = _start_workers(network_size, num_threads, r)
 
     try:
-        for t in threads:
-            t.join()
+        while True:
+            time.sleep(5)
+            new_size = _read_network_size(r, network_size)
+            if new_size != network_size:
+                print(f"[simulator] fleet size changed {network_size} → {new_size}, reloading")
+                stop.set()
+                for t in threads:
+                    t.join()
+                producer.flush()
+                producer.close()
+                network_size = new_size
+                threads, producer, stop = _start_workers(network_size, num_threads, r)
     except KeyboardInterrupt:
-        print("Shutting down simulator...")
+        print("[simulator] shutting down...")
         stop.set()
         for t in threads:
             t.join()
         producer.flush()
         producer.close()
-        print("Simulator stopped.")
+        print("[simulator] stopped.")
 
 
 def main() -> None:
@@ -373,8 +424,8 @@ def main() -> None:
     parser.add_argument(
         "--network-size",
         type=int,
-        default=3,
-        help="Number of real chargers to load from data/chargers.json (default: 3)",
+        default=20,
+        help="Number of chargers to load from data/chargers.json (default: 20)",
     )
     args = parser.parse_args()
     run(args.network_size)
