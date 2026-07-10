@@ -11,6 +11,7 @@ from pyspark.sql.functions import (
     col,
     concat,
     count,
+    countDistinct,
     first,
     from_json,
     lit,
@@ -299,7 +300,7 @@ def run():
 
         # By region
         for row in batch_df.groupBy("site_region").agg(
-            count("*").alias("active_sessions"),
+            countDistinct("charger_id").alias("active_sessions"),
             avg("charger_temperature").alias("avg_temperature"),
             avg("session_progress").alias("avg_session_progress"),
             avg("session_buffer").alias("avg_session_buffer"),
@@ -316,7 +317,7 @@ def run():
 
         # By connector type
         for row in batch_df.groupBy("connector_type").agg(
-            count("*").alias("active_sessions"),
+            countDistinct("charger_id").alias("active_sessions"),
             avg("power_output_kw").alias("avg_power_kw"),
             avg("rated_power_kw").alias("avg_rated_power_kw"),
             avg("energy_delivered_kwh").alias("avg_energy_kwh"),
@@ -335,7 +336,7 @@ def run():
 
         # Network-wide
         row = batch_df.agg(
-            count("*").alias("total_active_sessions"),
+            countDistinct("charger_id").alias("total_active_sessions"),
             avg("charger_temperature").alias("avg_temperature"),
             avg("session_buffer").alias("avg_session_buffer"),
             avg("power_output_kw").alias("avg_power_kw"),
