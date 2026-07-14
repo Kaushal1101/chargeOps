@@ -11,17 +11,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 
 import redis
 from kafka import KafkaConsumer
 
-KAFKA_BOOTSTRAP = "kafka:9092"
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 RISK_ALERTS_TOPIC = "risk-alerts"
 CONSUMER_GROUP = "logishield-redis-state"
-REDIS_HOST = "redis"
-REDIS_PORT = 6379
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 CHARGER_KEY_TTL_SECONDS = 420
 
 
@@ -81,7 +82,7 @@ def run(verbose: bool = False) -> None:
                     "avg_temperature": str(alert.get("avg_temperature", "")),
                     "window_start": alert.get("window_start", ""),
                     "window_end": alert.get("window_end", ""),
-                    "alert_ts": alert.get("alert_ts", ""),
+                    "last_update": alert.get("alert_ts", ""),
                     "reason": alert.get("reason", ""),
                     "session_state": alert.get("session_state", ""),
                     "session_id": alert.get("session_id", ""),

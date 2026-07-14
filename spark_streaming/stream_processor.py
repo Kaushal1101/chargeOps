@@ -22,6 +22,7 @@ from pyspark.sql.functions import (
     lit,
     max,
     min,
+    round,
     struct,
     to_json,
     udf,
@@ -208,7 +209,7 @@ def run():
         col("window.end").cast("string").alias("window_end"),
         col("charger_id"),
         col("risk_tier"),
-        col("avg_session_buffer").cast(IntegerType()).alias("session_buffer"),
+        round(col("avg_session_buffer")).cast(IntegerType()).alias("session_buffer"),
         col("avg_charger_temperature").alias("avg_temperature"),
         when(
             col("risk_tier") == "RED",
@@ -216,7 +217,7 @@ def run():
                 col("avg_session_buffer") < 0,
                 concat(
                     lit("Session projected to overrun by "),
-                    (col("avg_session_buffer") * -1).cast("integer").cast("string"),
+                    round(col("avg_session_buffer") * -1).cast("integer").cast("string"),
                     lit("min"),
                 ),
             ).otherwise(
@@ -232,7 +233,7 @@ def run():
                 col("avg_session_buffer") < col("session_buffer_threshold"),
                 concat(
                     lit("Session buffer below threshold: "),
-                    col("avg_session_buffer").cast("integer").cast("string"),
+                    round(col("avg_session_buffer")).cast("integer").cast("string"),
                     lit("min"),
                 ),
             ).otherwise(

@@ -4,3 +4,5 @@ __pycache__/
 *.pyo
 benchmarks/results/
 data/chargers_raw.json
+docs/bullet-library.md
+.claude/session-summary.md

@@ -91,8 +91,8 @@ services:
     container_name: simulator
     command: python -m simulator.simulator --network-size ${FLEET_SIZE:-20}
     depends_on:
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     restart: on-failure
 
   redis-consumer:
@@ -100,8 +100,8 @@ services:
     container_name: redis-consumer
     command: python -m redis_consumer.state_consumer
     depends_on:
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       redis-init:
         condition: service_completed_successfully
     restart: on-failure
@@ -111,8 +111,8 @@ services:
     container_name: stream-processor
     command: python spark_streaming/stream_processor.py
     depends_on:
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       redis-init:
         condition: service_completed_successfully
     environment:
