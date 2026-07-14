@@ -1,50 +1,104 @@
-# 📄 Event Schema Specification
+# Event Schema Specification
 
 This document defines the canonical event schemas used throughout the LogiShield Pipeline.
 
-All services (Simulator, Spark Streaming, AI Agent, Benchmarking) must adhere to these contracts to prevent schema drift.
+All services (Simulator, Spark Streaming, Redis Consumer, Dashboard) must adhere to these contracts to prevent schema drift.
+
+> **Note:** Phases 1–8 used a truck delivery schema (`vehicle_id`, `cargo_temperature`, `delivery_buffer`, etc.). Phase 9 migrated to the EV charging schema defined here. The old schema is preserved in `docs/phases/phase_8/` for historical reference.
 
 ---
 
 # 1. Telemetry Event
 
-Kafka Topic: `fleet-telemetry`
+Kafka Topic: `charger-telemetry`
 
-The telemetry event represents a single state update from a truck.
+Emitted by the charger simulator on every tick. Represents a single state update from one EV charging station.
 
 ## Schema
 
-| Field | Type | Required | Description |
-|---------|---------|---------|-------------|
-| event_id | string | Yes | Unique identifier for the event (UUID v4) |
-| event_ts | string (ISO-8601) | Yes | Timestamp when the event occurred |
-| vehicle_id | string | Yes | Truck identifier |
-| cargo_temperature | float | Yes | Current cargo temperature in °C |
-| time_left_to_destination | integer | Yes | Estimated minutes remaining to destination |
-| sla_time_remaining | integer | Yes | Remaining SLA time buffer in minutes |
-| scenario_state | string | Yes | Simulator injection state (GREEN, YELLOW, RED) — see note below |
-| sla_buffer_threshold | integer | Yes | Minimum acceptable delivery buffer in minutes before risk escalation |
-| cargo_temp_threshold | float | Yes | Maximum acceptable cargo temperature in °C |
+### Identity and Timing
 
-**Note on `scenario_state`:** This field reflects the scenario the simulator is actively injecting, not the risk tier independently calculated by Spark. In normal operation these will align. During chaos testing or edge-case simulation they may diverge. `scenario_state` is the simulator's control variable; `risk_tier` is Spark's output.
+| Field | Type | Description |
+|---|---|---|
+| `event_id` | string (UUID v4) | Unique event identifier |
+| `event_ts` | string (ISO-8601) | Timestamp when the event occurred — used for Spark event-time windowing |
+| `charger_id` | string | Charger identifier, e.g. `SG-0001` |
+| `scenario_state` | string | Simulator injection state: `GREEN`, `YELLOW`, or `RED` — distinct from the `risk_tier` computed by Spark |
 
-**Note on threshold fields:** `sla_buffer_threshold` and `cargo_temp_threshold` are set per-vehicle at simulator initialization and repeated on every event. This makes each event self-describing — Spark can evaluate risk on a single row without joining against external state. These fields are simulator-owned and must never be modified by downstream services.
+### Session Lifecycle
+
+| Field | Type | Description |
+|---|---|---|
+| `session_state` | string | `AVAILABLE`, `INITIALIZING`, `CHARGING`, or `SESSION_COMPLETE` |
+| `session_id` | string (UUID v4) | Unique identifier for the current session. Empty string when AVAILABLE. |
+
+### Static Charger Properties (set at construction, never change)
+
+| Field | Type | Description |
+|---|---|---|
+| `charger_lat` | float | WGS84 latitude (Singapore range: ~1.25–1.47) |
+| `charger_lng` | float | WGS84 longitude (Singapore range: ~103.6–104.0) |
+| `rated_power_kw` | float | Charger's nameplate capacity in kW |
+| `site_id` | string | Site name, e.g. `Changi_Airport` |
+| `site_region` | string | `North`, `South`, `East`, `West`, or `Central` |
+| `temp_threshold` | float | Maximum acceptable charger temperature in °C |
+| `session_buffer_threshold` | integer | Minimum acceptable session buffer in minutes before YELLOW risk |
+
+### Static Session Context (assigned at INITIALIZING, immutable for the session)
+
+| Field | Type | Description |
+|---|---|---|
+| `connector_type` | string | `CCS2`, `CHAdeMO`, `Type2`, or `HPC` |
+| `energy_requested_kwh` | float | Energy the vehicle needs this session (kWh) |
+| `user_tier` | string | `Standard`, `Priority`, or `Corporate` |
+| `charging_speed` | string | `Standard`, `Fast`, or `Ultra-Fast` |
+
+### Dynamic Session Fields (evolve during CHARGING)
+
+| Field | Type | Description |
+|---|---|---|
+| `session_progress` | float | 0.0 → 1.0 as session completes |
+| `estimated_completion_minutes` | integer | Estimated minutes until session completes |
+| `session_time_remaining` | integer | Minutes remaining in the scheduled session window |
+| `power_output_kw` | float | Real-time power delivery in kW |
+| `energy_delivered_kwh` | float | Cumulative energy delivered this session |
+| `charger_temperature` | float | Current charger hardware temperature in °C |
+
+All dynamic fields emit 0 or 0.0 when `session_state != "CHARGING"`.
+
+**Note on `scenario_state`:** This reflects the scenario the simulator is actively injecting, not the risk tier independently calculated by Spark. In normal operation these align. During chaos testing they may diverge. `scenario_state` is the simulator's control variable; `risk_tier` is Spark's output.
+
+**Note on self-describing events:** `temp_threshold` and `session_buffer_threshold` are per-charger values repeated on every event. This makes each event independently interpretable — Spark evaluates risk on a single row with no external joins or per-charger state stores.
 
 ---
 
-## Example Payload
+## Example Payload (CHARGING)
 
 ```json
 {
-  "event_id": "3f4a1b2c-8e9d-4f5a-b6c7-1d2e3f4a5b6c",
-  "event_ts": "2026-06-05T10:15:30Z",
-  "vehicle_id": "TRUCK_101",
-  "cargo_temperature": 4.2,
-  "time_left_to_destination": 95,
-  "sla_time_remaining": 140,
-  "scenario_state": "GREEN",
-  "sla_buffer_threshold": 30,
-  "cargo_temp_threshold": 5.0
+  "event_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "event_ts": "2026-07-03T10:15:30.000000Z",
+  "charger_id": "SG-0004",
+  "scenario_state": "YELLOW",
+  "session_state": "CHARGING",
+  "session_id": "f9e8d7c6-b5a4-3210-fedc-ba9876543210",
+  "charger_lat": 1.3644,
+  "charger_lng": 103.9915,
+  "rated_power_kw": 150.0,
+  "site_id": "Changi_Airport",
+  "site_region": "East",
+  "temp_threshold": 52.0,
+  "session_buffer_threshold": 8,
+  "connector_type": "CCS2",
+  "energy_requested_kwh": 54.3,
+  "user_tier": "Priority",
+  "charging_speed": "Fast",
+  "session_progress": 0.42,
+  "estimated_completion_minutes": 18,
+  "session_time_remaining": 21,
+  "power_output_kw": 112.4,
+  "energy_delivered_kwh": 22.8,
+  "charger_temperature": 47.6
 }
 ```
 
@@ -52,16 +106,14 @@ The telemetry event represents a single state update from a truck.
 
 # 2. Derived Streaming Metrics
 
-These values are calculated by Spark and are not produced by the simulator.
-
-## Fields
+Computed by Spark within the 5-minute sliding window. Not produced by the simulator.
 
 | Field | Type | Description |
-|---------|---------|-------------|
-| delivery_buffer | integer | `sla_time_remaining - time_left_to_destination`. Can be negative if SLA is already breached. |
-| avg_delivery_buffer | float | Rolling average buffer over window |
-| max_temperature | float | Maximum observed temperature in window |
-| risk_tier | string | GREEN, YELLOW, or RED — independently determined by Spark from metrics |
+|---|---|---|
+| `session_buffer` | integer | `session_time_remaining - estimated_completion_minutes`. Negative means session is projected to overrun. |
+| `avg_session_buffer` | float | Rolling average session buffer over the window |
+| `avg_charger_temperature` | float | Rolling average charger temperature over the window |
+| `risk_tier` | string | `GREEN`, `YELLOW`, or `RED` — independently determined by Spark |
 
 ---
 
@@ -69,53 +121,45 @@ These values are calculated by Spark and are not produced by the simulator.
 
 Kafka Topic: `risk-alerts`
 
-Produced by Spark when a shipment enters Yellow or Red status.
-
-## Schema
-
-| Field | Type | Required | Description |
-|---------|---------|---------|-------------|
-| event_id | string | Yes | Original telemetry event ID |
-| event_ts | string | Yes | Timestamp of triggering event |
-| vehicle_id | string | Yes | Truck identifier |
-| risk_tier | string | Yes | YELLOW or RED |
-| delivery_buffer | integer | Yes | Current delivery buffer (negative values indicate SLA already breached) |
-| cargo_temperature | float | Yes | Current cargo temperature |
-| reason | string | Yes | Free-form string (max 200 chars) describing the specific trigger condition. Examples: "Delivery buffer below 15 minutes", "Cargo temperature exceeded 7°C threshold" |
-
----
-
-## Example Payload
-
-```json
-{
-  "event_id": "evt_000245",
-  "event_ts": "2026-06-05T10:22:10Z",
-  "vehicle_id": "TRUCK_101",
-  "risk_tier": "YELLOW",
-  "delivery_buffer": 12,
-  "cargo_temperature": 5.1,
-  "reason": "Delivery buffer below 15 minutes"
-}
-```
-
----
-
-# 4. AI Remediation Output
-
-Generated by the AI agent after consuming a risk alert.
-
-This output may be written to logs, files, or a future Kafka topic.
+Produced by Spark when a charger enters YELLOW or RED status. Only emitted on tier transitions — a sustained RED does not produce repeated alerts.
 
 ## Schema
 
 | Field | Type | Description |
-|---------|---------|-------------|
-| vehicle_id | string | Truck identifier |
-| risk_tier | string | Alert severity |
-| business_impact | string | Estimated operational impact |
-| recommended_action | string | Suggested mitigation |
-| summary | string | One-sentence operational brief combining impact and action |
+|---|---|---|
+| `event_id` | string (UUID v4) | Alert identifier |
+| `window_start` | string | Start of the aggregation window |
+| `window_end` | string | End of the aggregation window |
+| `alert_ts` | string (ISO-8601) | Timestamp when the alert was emitted |
+| `charger_id` | string | Charger identifier |
+| `risk_tier` | string | `YELLOW` or `RED` |
+| `session_buffer` | integer | Average session buffer over the window |
+| `avg_temperature` | float | Average charger temperature over the window |
+| `reason` | string | Human-readable trigger description |
+| `session_state` | string | Always `CHARGING` (non-CHARGING events are filtered before aggregation) |
+| `session_id` | string | Session identifier |
+| `connector_type` | string | Connector type for this session |
+| `energy_requested_kwh` | float | Session energy demand |
+| `user_tier` | string | Customer tier |
+| `charging_speed` | string | Charging speed tier |
+| `site_region` | string | Geographic region |
+| `charger_lat` | float | Charger latitude |
+| `charger_lng` | float | Charger longitude |
+| `rated_power_kw` | float | Charger's nameplate capacity |
+| `site_id` | string | Site name |
+| `session_progress` | float | Session progress at time of alert |
+| `power_output_kw` | float | Peak power output in the window |
+| `energy_delivered_kwh` | float | Energy delivered so far this session |
+| `estimated_completion_minutes` | integer | Estimated minutes to session completion |
+
+### Reason String Format
+
+| Condition | Example |
+|---|---|
+| RED — session overrun | `"Session projected to overrun by 4min"` |
+| RED — temperature | `"Charger temperature exceeded threshold: 53.2C"` |
+| YELLOW — buffer | `"Session buffer below threshold: 3min"` |
+| YELLOW — temperature | `"Charger temperature approaching threshold: 47.8C"` |
 
 ---
 
@@ -123,11 +167,30 @@ This output may be written to logs, files, or a future Kafka topic.
 
 ```json
 {
-  "vehicle_id": "TRUCK_101",
-  "risk_tier": "RED",
-  "business_impact": "Potential cold-chain violation and SLA breach",
-  "recommended_action": "Dispatch nearest backup vehicle and notify customer",
-  "summary": "TRUCK_101 is at high risk of cold-chain failure and should be rerouted immediately."
+  "event_id": "c3d4e5f6-a7b8-9012-cdef-345678901234",
+  "window_start": "2026-07-03 10:10:00",
+  "window_end": "2026-07-03 10:15:00",
+  "alert_ts": "2026-07-03T10:15:05.123456+00:00",
+  "charger_id": "SG-0004",
+  "risk_tier": "YELLOW",
+  "session_buffer": 3,
+  "avg_temperature": 47.8,
+  "reason": "Session buffer below threshold: 3min",
+  "session_state": "CHARGING",
+  "session_id": "f9e8d7c6-b5a4-3210-fedc-ba9876543210",
+  "connector_type": "CCS2",
+  "energy_requested_kwh": 54.3,
+  "user_tier": "Priority",
+  "charging_speed": "Fast",
+  "site_region": "East",
+  "charger_lat": 1.3644,
+  "charger_lng": 103.9915,
+  "rated_power_kw": 150.0,
+  "site_id": "Changi_Airport",
+  "session_progress": 0.58,
+  "power_output_kw": 118.2,
+  "energy_delivered_kwh": 31.5,
+  "estimated_completion_minutes": 13
 }
 ```
 
@@ -136,22 +199,28 @@ This output may be written to logs, files, or a future Kafka topic.
 # Event Lifecycle
 
 ```text
-Telemetry Event
-      │
-      ▼
-fleet-telemetry
-      │
-      ▼
-Spark Processing
-      │
-      ▼
-Risk Alert Event
-      │
-      ▼
-risk-alerts
-      │
-      ▼
-AI Remediation Output
+Telemetry Event (all session states)
+          │
+          ▼
+  charger-telemetry
+          │
+          ▼
+  Spark — filter: session_state == CHARGING
+          │
+          ▼
+  Windowed aggregation (5min / 30s slide)
+          │
+          ▼
+  Risk tiering (GREEN / YELLOW / RED)
+          │
+          ▼
+  Transition filter (emit only on tier change)
+          │
+          ▼
+      risk-alerts
+          │
+          ▼
+  Redis per-charger state (charger:{charger_id})
 ```
 
 ---
@@ -159,17 +228,17 @@ AI Remediation Output
 # Design Rules
 
 ### Schema Stability
-
-Fields defined in this document should not be renamed or removed without updating all dependent services.
+Fields defined here should not be renamed or removed without updating all dependent services and clearing the Spark checkpoint.
 
 ### Event-Time Processing
-
-`event_ts` is the authoritative timestamp used for Spark windowing and watermarking.
+`event_ts` is the authoritative timestamp for Spark windowing and watermarking.
 
 ### Source of Truth
-
-- Simulator owns telemetry events.
-- Spark owns derived metrics and risk alerts.
-- AI Agent owns remediation outputs.
+- Simulator owns telemetry events and per-charger thresholds
+- Spark owns derived metrics and risk alerts
+- Redis consumer owns operational state materialisation
 
 No component should modify fields owned by another component.
+
+### Self-Describing Events
+`temp_threshold` and `session_buffer_threshold` are repeated on every event. Spark evaluates risk on a single row with no external state or stream joins.

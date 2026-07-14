@@ -246,3 +246,17 @@ The **LogiShield Pipeline** is a real-time logistics risk detection system that 
 3. Separate the temperature and buffer metrics into independent classifiers rather than combining them with `max`
 
 **Not blocking Phase 4** — the AI agent will still receive meaningful RED alerts. Revisit when tuning alert quality.
+
+---
+
+### Decision 18: Domain Pivot to EV Charging Network Operations (Phase 9)
+
+**Context:** After completing Phase 8, the streaming architecture was mature — stateful Kafka → Spark → Redis → Dashboard pipeline with lifecycle simulation, windowed risk classification, watermarking, and transition deduplication. However, the truck delivery monitoring narrative was generic. The "risk" being detected (delivery delays, cargo temperature violations) lacked a compelling operational problem and limited the project's storytelling potential.
+
+**The Decision:** Migrate the domain to EV charging network operations while leaving the entire streaming architecture unchanged. Trucks become chargers. Trips become sessions. Cargo temperature becomes charger temperature. The delivery buffer becomes the session buffer. The Kafka topic `fleet-telemetry` becomes `charger-telemetry`. Redis keys move from `truck:` to `charger:` prefixes.
+
+**Justification:** EV charging infrastructure monitoring is a cleaner operational problem: operators need to know in real time which chargers are degraded, faulted, or at risk of session overrun — and the consequences of missing this are immediate (failed sessions, stranded customers). The risk model maps directly: temperature threshold exceedance and session buffer depletion are natural equivalents of cargo temperature and delivery buffer. The domain also enables a future capability that was not feasible with trucks — geographic charger visualisation and best-charger recommendations — since every charger carries real Singapore coordinates (`charger_lat`, `charger_lng`) in the schema.
+
+**What did not change:** Docker Compose infrastructure, Kafka producer configuration, threading model, Spark watermarking, window parameters, `foreachBatch` deduplication pattern, Redis TTL logic, dashboard auto-refresh. The distributed systems work is fully preserved.
+
+**Migration approach:** Phases 9A–9C executed the migration layer by layer — simulator and data model first (9A), then Spark (9B), then Redis consumer and dashboard (9C). Each layer was independently verifiable before proceeding to the next. The old `fleet-telemetry` topic was left in place in Kafka; `charger-telemetry` was created manually since Docker containers were already running when `docker-compose.yml` was updated.

@@ -47,36 +47,11 @@ services:
     command: >
       bash -c "
       echo 'Creating Kafka topics...' &&
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic fleet-telemetry --partitions 12 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic charger-telemetry --partitions 12 --replication-factor 1 &&
       kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic risk-alerts --partitions 12 --replication-factor 1 &&
       echo 'Topics created successfully.' &&
       kafka-topics --bootstrap-server kafka:9092 --list
       "
-
-  spark-master:
-    image: apache/spark:3.5.1
-    container_name: spark-master
-    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
-    environment:
-      SPARK_NO_DAEMONIZE: "true"
-    ports:
-      - "8081:8080"
-      - "7077:7077"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-
-  spark-worker:
-    image: apache/spark:3.5.1
-    container_name: spark-worker
-    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
-    environment:
-      SPARK_NO_DAEMONIZE: "true"
-    depends_on:
-      - spark-master
 
   redis:
     image: redis:7
@@ -90,6 +65,15 @@ services:
       retries: 5
       start_period: 5s
 
+  redis-init:
+    image: redis:7
+    container_name: redis-init
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: redis-cli -h redis FLUSHALL
+    restart: "no"
+
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
@@ -101,3 +85,64 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: logishield
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+  simulator:
+    build: .
+    container_name: simulator
+    command: python -m simulator.simulator --network-size ${FLEET_SIZE:-20}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  redis-consumer:
+    build: .
+    container_name: redis-consumer
+    command: python -m redis_consumer.state_consumer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis-init:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  stream-processor:
+    build: .
+    container_name: stream-processor
+    command: python spark_streaming/stream_processor.py
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    restart: on-failure
+
+  api:
+    build: .
+    container_name: api
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    restart: on-failure
+
+  dashboard:
+    build: .
+    container_name: dashboard
+    command: streamlit run dashboard/app.py --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    environment:
+      API_BASE_URL: http://api:8000
+    restart: on-failure

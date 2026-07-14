@@ -1115,4 +1115,275 @@ The enriched trip schema now flows end-to-end through the full pipeline:
 
 **Simulator → Kafka → Spark → `risk-alerts` → Redis → Dashboard**
 
+---
+
+## 2026-07-03 — Phase 9: Domain Pivot to EV Charging Network Operations
+
+### Why We Pivoted
+
+After completing Phase 8, the underlying streaming architecture was mature: a stateful Kafka → Spark → Redis → Dashboard pipeline with realistic lifecycle simulation, windowed risk classification, event-time watermarking, and transition-deduplication alerting. However, the "truck delivery monitoring" narrative was generic and lacked a clear operational problem.
+
+The decision was made to migrate the domain to **EV charging network operations** — a real-time platform for monitoring the health and availability of a distributed EV charging network across Singapore. The operational problem is more compelling: operators need to know which chargers are degraded, faulted, or overloaded in real time, before sessions fail or customers are stranded.
+
+The architecture is unchanged. Every distributed systems property built across Phases 1–8 is preserved:
+- Kafka as the central event bus
+- Spark Structured Streaming with sliding windows and watermarking
+- Stateful foreachBatch transition deduplication
+- Redis per-asset state with TTL-based eviction
+- Streamlit operations dashboard
+
+Only the domain vocabulary changed. Trucks became chargers. Trips became sessions. Cargo temperature became charger temperature. The delivery buffer became the session buffer.
+
+The pivot also positions the project for a future capability that was not feasible in the truck domain: **geographic charger recommendations**. Every charger now carries real Singapore coordinates (`charger_lat`, `charger_lng`) in its schema, enabling a future map-based view and best-charger query without any pipeline changes.
+
+---
+
+## 2026-07-03 — Phase 9A: Simulator and Data Model
+
+### What Was Completed
+
+- `simulator/models.py` — `TelemetryEvent` migrated to EV schema: `charger_id`, `charger_temperature`, `session_state`, `session_id`, `connector_type`, `energy_requested_kwh`, `user_tier`, `charging_speed`, `site_region`, `session_progress`, `power_output_kw`, `energy_delivered_kwh`, `session_time_remaining`, `session_buffer_threshold`, `temp_threshold`, `estimated_completion_minutes`. New static fields: `charger_lat`, `charger_lng`, `rated_power_kw`, `site_id`.
+- `simulator/simulator.py` — `Vehicle` → `Charger`, `Fleet` → `Network`, `TripContext` → `SessionContext`. Lifecycle states renamed: `IDLE → AVAILABLE`, `LOADING → INITIALIZING`, `IN_TRANSIT → CHARGING`, `DELIVERY_COMPLETE → SESSION_COMPLETE`. `Scenario.generate_values()` updated for charger temperature and session timing ranges. Singapore site pool added (`_SITES`, 10 locations). `_rated_power()` helper assigns kW capacity by connector type. Kafka topic updated to `charger-telemetry`. CLI arg `--fleet-size` → `--network-size`.
+- `docker-compose.yml` — `kafka-init` updated to create `charger-telemetry` topic instead of `fleet-telemetry`.
+
+### Bug Fixed During Review: `site_region` Inconsistency
+
+Cursor assigned `site_region` via `SessionContext.generate()`, which picked randomly from `_SITE_REGIONS`. This meant a charger physically at Changi Airport (East) could report `site_region="North"` during a session — inconsistent with `charger_lat`, `charger_lng`, and `site_id`.
+
+Fix: removed `site_region` from `SessionContext`. Added it as a static field on `Charger`, assigned from the `_SITES` pool at construction time and emitted on every event from `self.site_region`. Guarantees geographic consistency across all charger fields.
+
+### Key Design Decisions
+
+**`site_region` as a static charger property, not a session property**
+`site_region` reflects physical location, which does not change between sessions. Assigning it per-session would decouple it from `charger_lat`/`charger_lng`/`site_id`, breaking geographic consistency. The fix stores it on the `Charger` alongside the other static location fields.
+
+**`estimated_completion_minutes` replaces both `time_left_to_destination` and `estimated_arrival_minutes`**
+The old schema had two time fields that both expressed "time remaining." In the EV schema, these are merged into a single clean field: `estimated_completion_minutes`. The Scenario-generated value drives the risk signal (session buffer); the dynamically computed value from `_compute_dynamic_fields()` is no longer needed as a separate field.
+
+**`power_output_kw` replaces `remaining_stops`**
+Real-time power delivery is the EV equivalent of operational progress. A charger derated to 30% of rated capacity is the most operationally interesting live signal for network operators.
+
+### Bug Found During Testing: `charger-telemetry` Topic Missing
+
+After updating `docker-compose.yml`, Docker containers were already running from the previous configuration. `kafka-init` only runs on first start and does not re-run. The `charger-telemetry` topic did not exist, causing the Kafka producer's `send()` call to block waiting for topic metadata — worker threads appeared to run but generated 0 events.
+
+Fix: created the topic manually with `docker exec kafka kafka-topics --bootstrap-server localhost:9092 --create --topic charger-telemetry --partitions 12 --replication-factor 1`. For future reference: whenever `docker-compose.yml` topic names change, restart Docker or create missing topics manually if containers are already running.
+
+---
+
+## 2026-07-03 — Phase 9B: Spark Stream Processor
+
+### What Was Completed
+
+- `spark_streaming/stream_processor.py` — `TELEMETRY_SCHEMA` updated to EV field names. `structured` select updated. `session_buffer = session_time_remaining - estimated_completion_minutes` replaces `delivery_buffer`. Filter updated: `col("session_state") == "CHARGING"`. `groupBy` updated to `charger_id`. All 18 aggregations updated including new fields: `charger_lat`, `charger_lng`, `rated_power_kw`, `site_id`, `max_power_output_kw`, `max_energy_delivered_kwh`. Risk tiering updated to reference `avg_session_buffer` and `avg_charger_temperature`. `alert_records` select updated with EV reason strings. Deduplication key updated to `(charger_id, session_id)`. Topic subscription updated to `charger-telemetry`.
+
+### What Was Not Changed
+
+SparkSession configuration, watermark duration, window size and slide, `foreachBatch` pattern, checkpoint location, output topic (`risk-alerts`), `gen_id` UDF, trigger interval, output mode. The distributed systems core is identical.
+
+### Checkpoint Note
+
+Checkpoint must be cleared before restarting Spark after this change:
+`rm -rf /tmp/logishield-checkpoints/risk-alerts`
+
+---
+
+## 2026-07-03 — Phase 9C: Redis Consumer and Dashboard
+
+### What Was Completed
+
+- `redis_consumer/state_consumer.py` — `_recount_fleet()` → `_recount_network()`. All key prefixes updated: `truck:` → `charger:`, `fleet:counts` → `network:counts`, `fleet:last_update` → `network:last_update`. `hset` mapping updated to all 23 EV fields including geographic fields. `CHARGER_KEY_TTL_SECONDS` renamed. Verbose log updated.
+- `dashboard/app.py` — `TRUCK_COLUMNS` → `CHARGER_COLUMNS` with EV field set. All Redis key reads updated. Section headers updated: Network Summary, Active Chargers, Charger Lookup. `_fmt_route_progress()` → `_fmt_session_progress()`. Scan pattern updated to `charger:*`. Sort key updated to `charger_id`. Lookup updated to `charger:{charger_id}`.
+
+### Phase 9 Complete
+
+The full pipeline now operates as an EV charging network operations platform:
+
+**Charger Simulator → `charger-telemetry` → Spark → `risk-alerts` → Redis → Dashboard**
+
+Every layer carries the EV schema end-to-end. The distributed systems architecture built across Phases 1–8 is fully preserved. The domain is now operationally meaningful, geographically anchored to Singapore, and structured to support future capabilities (map view, best-charger recommendations) without pipeline changes.
+
 Every layer — Spark output, Redis hash, and dashboard table — carries `trip_state`, route progress, and arrival estimates alongside the existing risk fields. The pipeline now represents a realistic logistics lifecycle observable from telemetry through to the operations dashboard without any change to the underlying risk detection logic.
+
+---
+
+## 2026-07-04 — Phase 10A: Real Singapore Charger Data — Source Evaluation
+
+### What Was Completed
+
+- Evaluated LTA DataMall EVCBatch API as the source for real Singapore EV charger inventory
+- Fetched raw dataset using pre-signed S3 URL mechanism (API key authenticated, URL valid for 5 minutes)
+- Confirmed data quality: 2,708 locations, 8,877 charging points, real coordinates and operator names
+- Added `data/chargers_raw.json` to `.gitignore` (3.1 MB raw API response, not committed)
+
+### Dataset Quality
+
+| Metric | Value |
+|---|---|
+| Total locations | 2,708 |
+| Total charging points | 8,877 |
+| Geographic coverage | Singapore-wide, WGS84 coordinates |
+| Connector types present | Type 2, CCS2 (Combo 2), CHAdeMO |
+| Power range | 3.7 – 480.0 kW |
+| Operators identified | SP Mobility, ComfortDelGro Engie, Shell, Charge+, Strides YTL, and others |
+| Last updated | 2026-07-03 16:35:00 |
+
+### Data Source Decision
+
+LTA DataMall met all acceptance criteria: 8,877 charger records, latitude and longitude present for all records, real site names and addresses, power ratings for all entries, and major operator names correctly attributed. No fallback to a curated hand-built dataset was needed.
+
+---
+
+## 2026-07-04 — Phase 10B: Data Normalisation
+
+### What Was Completed
+
+- `scripts/build_charger_snapshot.py` — one-time normalisation script that reads `data/chargers_raw.json` and writes `data/chargers.json`
+- `data/chargers.json` — committed normalised snapshot of 8,877 real Singapore EV charger records
+
+### Normalisation Logic
+
+- One charger record per `chargingPoint` in the raw dataset, keyed by the first `evCpId`
+- Best plug type selected per charging point: highest `powerRating` wins
+- Connector type mapped: `"Type 2"` → `"Type2"`, `"Combo 2"` → `"CCS2"`, `"CHAdeMO"` → `"CHAdeMO"`
+- Site region derived from WGS84 coordinates using Singapore bounding boxes (South/North/East/West/Central)
+- Site ID slugified from site name (alphanumeric + underscores, max 50 characters)
+
+### Output Statistics
+
+| Metric | Value |
+|---|---|
+| Total chargers | 8,877 |
+| East | 3,077 |
+| Central | 2,576 |
+| West | 1,785 |
+| North | 1,384 |
+| South | 55 |
+| Type2 connectors | 8,095 |
+| CCS2 connectors | 782 |
+| Power range | 3.7 – 480.0 kW |
+
+To regenerate the snapshot: `python scripts/build_charger_snapshot.py` (requires `data/chargers_raw.json`; re-fetch via `scripts/fetch_chargers.py`).
+
+---
+
+## 2026-07-04 — Phase 10C: Simulator Integration
+
+### What Was Completed
+
+- `simulator/simulator.py` — `Network.from_dataset()` classmethod added; loads from `data/chargers.json`
+- `Charger.__init__` updated to accept `connector_type` as a constructor parameter, stored as `self.connector_type`
+- `SessionContext.generate()` updated to accept `connector_type: str` — sessions now use the charger's real connector type rather than a random selection
+- `_SITES`, `_rated_power()`, `_CONNECTOR_TYPES`, `_SITE_REGIONS` removed — all static charger properties now come from the dataset
+- CLI `--network-size` samples N chargers from the dataset (default: 3 for development; pass `8877` for full network)
+
+### Key Design Decision
+
+**`connector_type` flows dataset → Charger → SessionContext, not random**
+Each physical charger supports a fixed connector type. Sessions at that charger must use the charger's type. Removing the random selection ensures every telemetry event carries the correct connector type for the physical hardware it represents.
+
+---
+
+## 2026-07-04 — Phase 10D: Alert Map
+
+### What Was Completed
+
+- `dashboard/app.py` — Alert Map section added between Network Summary and Active Chargers
+- Uses `st.pydeck_chart` with a `pydeck.ScatterplotLayer` over Singapore
+- RED alerts rendered as red dots `[220, 38, 38]`, YELLOW alerts as yellow dots `[234, 179, 8]`
+- Tooltip shows `charger_id`, `site_id`, tier, and reason on hover
+- Map centered on Singapore (lat 1.352, lng 103.820), zoom 11
+
+### No Pipeline Changes
+
+`charger_lat` and `charger_lng` were already stored in every `charger:{id}` Redis hash since Phase 9. The map reads from the same Redis keys as the Active Chargers table — no schema changes, no new Redis writes, no Spark changes required.
+
+### Phase 10 Complete
+
+The simulator now loads real Singapore EV charger records as its network inventory. Charger IDs, coordinates, site names, connector types, power ratings, and operator names reflect the actual Singapore public charging network as of July 2026. The dashboard map shows alerted chargers at their real geographic locations across Singapore.
+
+---
+
+## 2026-07-05 — Phase 11: Real-Time Network Analytics
+
+### What Was Completed
+
+- `spark_streaming/stream_processor.py` — second streaming query added in parallel with the existing risk alert query. `write_stats` foreachBatch function computes three groupBy aggregations per micro-batch (by region, by connector type, network-wide) and writes results directly to Redis. `count` added to PySpark imports. `import redis as redis_client` added. `query.awaitTermination()` replaced with `spark.streams.awaitAnyTermination()`.
+- `dashboard/app.py` — Network Statistics section (Section 1.5) added between System Health and Network Summary. Reads `stats:network`, `stats:region:*`, and `stats:connector:*` from Redis. Renders four network-wide metric tiles, a regional breakdown table, and a connector type breakdown table. Degrades gracefully to a caption when Spark stats sink is not yet running.
+- `docs/phases/phase_11/phase_11_analytics.md` — phase plan with questions being answered, Redis key design, and sub-phase structure
+- `docs/limitations.md` — created: documents simulator-driven risk patterns, absence of historical store, single-node infrastructure constraint, and chaos injector staleness
+
+### Redis Keys Written by Stats Sink
+
+| Key pattern | Contents |
+|---|---|
+| `stats:region:{region}` | `active_sessions`, `avg_temperature`, `avg_session_progress`, `avg_session_buffer`, `avg_power_kw`, `last_update` |
+| `stats:connector:{type}` | `active_sessions`, `avg_power_kw`, `avg_rated_power_kw`, `avg_utilization_pct`, `avg_energy_kwh`, `last_update` |
+| `stats:network` | `total_active_sessions`, `avg_temperature`, `avg_session_buffer`, `avg_power_kw`, `last_update` |
+
+### Key Design Decisions
+
+**Stats tapped from `charging` df, not the windowed aggregation**
+The windowed aggregation groups by `charger_id` and collapses many events into one row per charger per window. Tapping it for regional stats would lose the event count signal and produce averages of averages. The `charging` df (post-filter, pre-window) contains one row per raw event, giving correct per-batch counts and true field averages.
+
+**foreachBatch with in-batch groupBy, not a second windowed query**
+Regional stats don't need the same 5-minute sliding window as risk classification — a per-batch snapshot is sufficient. Using foreachBatch with `.groupBy()` inside the function is simpler, has no state to manage, and updates every 5 seconds rather than waiting for a window to close.
+
+**`avg_session_buffer` meaning**
+`session_buffer = session_time_remaining - estimated_completion_minutes`. Positive means sessions are on track; negative means sessions are collectively projected to overrun. The network-wide and regional averages give operators a quick read on whether the network is under session time pressure.
+
+**Separate checkpoint for stats query**
+`/tmp/logishield-checkpoints/charger-stats` is independent of `/tmp/logishield-checkpoints/risk-alerts`. The risk-alerts checkpoint remains valid across this change — no checkpoint clear required.
+
+### Phase 11 Complete
+
+The dashboard now surfaces real-time network analytics derived directly from the telemetry stream. Regional load, connector utilization, and network-wide averages update every 5 seconds alongside the existing alert view.
+
+---
+
+## 2026-07-10 — Phase 12: FastAPI Layer, Dashboard Decoupled from Redis, Full Containerization
+
+### What Was Completed
+
+- `api/main.py` — new FastAPI service exposing read-only Redis state over HTTP. Endpoints: `/health`, `/summary`, `/chargers`, `/chargers/{id}`, `/stats/network`, `/stats/regions`, `/stats/connectors`
+- `dashboard/app.py` — refactored to be a pure HTTP client to the API. All direct Redis reads removed. Dashboard now has no Redis dependency; the API owns all data access
+- `Dockerfile` — created with `python:3.11-slim` base. Java (`default-jre-headless`) added for Spark. Spark-Kafka connector JAR pre-downloaded into Ivy cache at build time so container startup is instant
+- `docker-compose.yml` — `simulator`, `redis-consumer`, `api`, `dashboard`, and `stream-processor` all containerized. `spark-master` and `spark-worker` removed (unused — Spark runs in `local[*]` mode inside `stream-processor`). `redis-init` service added: runs `redis-cli FLUSHALL` on every startup before consumers begin writing, guaranteeing a clean state each run. `FLEET_SIZE` environment variable controls simulator network size (default: 20)
+- `spark_streaming/stream_processor.py` — `KAFKA_BOOTSTRAP`, `REDIS_HOST`, `REDIS_PORT` now read from environment variables (defaults preserve local dev behaviour). `spark.jars.packages` config baked into `SparkSession` so no `spark-submit` invocation needed
+- `requirements.txt` — `fastapi==0.115.6`, `uvicorn[standard]==0.34.0` added
+
+### Bug Fixed: Stats Sink Inflated Session Counts
+
+`write_stats` used `count("*")` to compute `active_sessions` and `total_active_sessions`. With a 5-second micro-batch and ~1 event/second per charger, each charger contributed ~5 rows per batch — inflating session counts by ~5x.
+
+Fix: replaced `count("*")` with `countDistinct("charger_id")` in all three aggregations (by region, by connector type, network-wide). `countDistinct` imported from `pyspark.sql.functions`.
+
+### Key Design Decisions
+
+**API as the single Redis access boundary**
+Before this phase, the dashboard read directly from Redis. Moving all Redis access into the API means the dashboard has no knowledge of the data store — it only knows HTTP. This makes the dashboard testable in isolation, decouples it from Redis key schema changes, and is the correct layering for a production system.
+
+**Spark containerized in `local[*]` mode, not submitted to a cluster**
+The `spark-master` and `spark-worker` containers were present but never used — the Spark job ran in `local[*]` on the host machine. This phase formalizes that: `stream-processor` is a container that runs `python spark_streaming/stream_processor.py`, which starts Spark in `local[*]` mode within the container. This is correct for a single-node demo and removes the orphaned cluster containers.
+
+**Redis flushed on every startup via `redis-init`**
+A one-shot service runs `redis-cli -h redis FLUSHALL` after Redis is healthy and before `redis-consumer` and `stream-processor` start. This guarantees that every `docker-compose up -d` produces a clean dashboard with no stale state from a previous run.
+
+**Kafka connector JAR pre-downloaded at image build time**
+The previous workflow required `spark.jars.packages` to download the JAR on first run (~10–30s, network-dependent). Triggering a SparkSession at build time populates `~/.ivy2` in the image layer. Subsequent container starts skip the download entirely.
+
+**`FLEET_SIZE` environment variable**
+Fleet size is set via `FLEET_SIZE=N docker-compose up -d`, eliminating the need to edit `docker-compose.yml`. Defaults to 20.
+
+### Clean Start Workflow
+
+```bash
+# Full clean reset with new fleet size
+docker-compose down -v && FLEET_SIZE=50 docker-compose up -d
+```
+
+`down -v` removes ZooKeeper and Redis volumes. `redis-init` flushes Redis before consumers start. Spark checkpoints are discarded with the container. No manual steps required.
+
+### Phase 12 Complete
+
+The entire stack now runs from a single command. No local Java, Python, or `spark-submit` required. `FLEET_SIZE=N docker-compose up -d` is the only command needed to start the pipeline at any scale.
