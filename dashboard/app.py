@@ -1,4 +1,4 @@
-"""LogiShield operations dashboard — read-only fleet state from the Operational API.
+"""ChargeOps operations dashboard — read-only fleet state from the Operational API.
 
 Run with:
     streamlit run dashboard/app.py
@@ -52,7 +52,7 @@ def _fmt_ts(iso_str: str | None, mode: str = "relative") -> str:
         return iso_str
 
 
-st.set_page_config(page_title="LogiShield Operations", layout="wide")
+st.set_page_config(page_title="ChargeOps", layout="wide")
 
 # --- Fetch data ---
 try:

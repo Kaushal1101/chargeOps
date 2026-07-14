@@ -1,4 +1,4 @@
-"""LogiShield operational API — read-only Redis state over HTTP.
+"""ChargeOps operational API — read-only Redis state over HTTP.
 
 Run with:
     uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -17,7 +17,7 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 STALENESS_THRESHOLD_SECONDS = 600
 
-app = FastAPI(title="LogiShield Operational API")
+app = FastAPI(title="ChargeOps Operational API")
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 

@@ -1,4 +1,4 @@
-# LogiShield — Real-Time EV Charging Network Operations
+# ChargeOps — Real-Time EV Charging Network Operations
 
 A real-time infrastructure operations platform that monitors the health and availability of a distributed EV charging network. The system ingests continuous telemetry from simulated charging stations across Singapore, processes the stream with Apache Spark, classifies charger health in real time, and surfaces operational alerts through a Redis-backed dashboard.
 
@@ -102,7 +102,7 @@ The `FLEET_SIZE` cap is the number of real chargers in `data/chargers.json` (8,8
 ├── api/                FastAPI service — read-only Redis state over HTTP
 ├── dashboard/          Streamlit network operations console
 ├── data/               Real Singapore EV charger inventory (LTA DataMall, July 2026)
-├── .streamlit/         Streamlit theme configuration (dark mode, LogiShield brand colors)
+├── .streamlit/         Streamlit theme configuration (dark mode, ChargeOps brand colors)
 ├── benchmarks/         Throughput and latency measurement suite
 ├── chaos/              Fault injection utilities (out-of-order events, delayed bursts)
 ├── configs/            Shared configuration
